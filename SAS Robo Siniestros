@@ -1,0 +1,647 @@
+PROC SQL;
+    CREATE TABLE WORK.FILTRO_BC AS
+    SELECT DISTINCT T1.POLIZA
+    FROM WORK.Base_Correspondencia T1
+    WHERE UPPER(t1.'Familia de Riesgo'n) = 'FRAUDE';
+QUIT;
+
+PROC SQL NOPRINT;
+    SELECT QUOTE(TRIM(T1.POLIZA), "'") INTO :FILTRO_BC_AUX SEPARATED BY ','
+    FROM WORK.FILTRO_BC T1;
+QUIT;
+
+%PUT LISTA: FILTRO_BC_AUX;
+
+PROC SQL;
+    CREATE TABLE WORK.DW_SINIESTROS_AUX1 AS
+    SELECT t1.*, INPUT(t1.NUMERO_SINIESTRO,BEST16.) as NUMERO_SIN
+    FROM CLSNCPOP.DW_SINIESTROS t1
+    WHERE t1.poliza_madre IN (&FILTRO_BC_AUX)
+      AND t1.FEC_OCURRENCIA >= '1Jan2020'd;
+QUIT;
+
+/*BASE DE SINIESTROS LIB 1*/
+
+************************************************************************
+** 1.- SINIESTROS PAGADOS;
+************************************************************************
+
+** Paso 0: Base Madre;
+
+proc sql;
+    create table base_madrePag as
+    select  numero,
+            rutasegurado,
+            dvasegurado,
+            estadocuota,
+            poliza,
+            riesgoactuarial,
+            riesgooperaciones,
+            detalleresolucion,
+            agrupaciondetalleresolucion,
+            socioactuarial,
+            intnx('month',datepart(fechaocurrencia),0,'s')
+                format=ddmmyy10. as Fec_Ocurre,
+            intnx('month',datepart(fechaotorgamiento),0,'s')
+                format=ddmmyy10. as Fec_Otorgamiento,
+            intnx('month',datepart(aseguradofechanac),0,'s')
+                format=ddmmyy10. as Fec_Nacimiento,
+            input(strip(estadomes),anydtdte7.0)
+                format=ddmmyy10. as Mes_Estado,
+            totalcuotas
+                format=ddmmyy10. as totalcuotas,
+            montobruto
+                format=commax20.0 as montobruto
+    from LIB1.ACT_BASE_SINIESTRO
+    where estadocuota in ('PAGO TOTAL','PAGO PARCIAL','NUEVO PAGO',
+                          'RECUPERO','PENDIENTE','PAGO FUTURO')
+      and poliza IN (&FILTRO_BC_AUX)
+      and input(strip(estadomes),anydtdte7.0) <= &Fec_Cierre.
+      and FECHAOCURRENCIA >= '1Jan2020:0:0:0'dt
+    group by numero,
+             poliza,
+             riesgoactuarial,
+             riesgooperaciones,
+             socioactuarial,
+             Fec_Ocurre,
+             Mes_Estado
+    order by numero,
+             Fec_Ocurre,
+             Mes_Estado;
+quit;
+
+** Paso 0.1: Agrupamos por la minima fecha ocurrencia;
+
+proc sql;
+    create table base_madre_2 as
+    select  numero,
+            rutasegurado,
+            dvasegurado,
+            min(Fec_Otorgamiento) format=ddmmyy10. as Fec_Otorgamiento,
+            min(Fec_Ocurre)       format=ddmmyy10. as Fec_Ocurre,
+            min(Fec_Nacimiento)   format=ddmmyy10. as Fec_Nacimiento,
+            min(Mes_Estado)       format=ddmmyy10. as Min_Mes_Estado
+    from base_madrePag
+    group by numero;
+quit;
+
+** Paso 1: Pagados;
+
+proc sql;
+    create table base_aux_pagados_1 as
+    select  numero,
+            rutasegurado,
+            dvasegurado,
+            estadocuota,
+            poliza,
+            riesgoactuarial,
+            riesgooperaciones,
+            detalleresolucion,
+            agrupaciondetalleresolucion,
+            socioactuarial,
+            intnx('month',datepart(fechaotorgamiento),0,'s')
+                format=ddmmyy10. as Fec_Otorgamiento,
+            intnx('month',datepart(fechaocurrencia),0,'s')
+                format=ddmmyy10. as Fec_Ocurre,
+            input(strip(estadomes),anydtdte7.0)
+                format=ddmmyy10. as Mes_Estado,
+            totalcuotas
+                format=ddmmyy10. as totalcuotas,
+            montobruto
+                format=commax20.0 as montobruto
+    from LIB1.ACT_BASE_SINIESTRO
+    where estadocuota in ('PAGO TOTAL','PAGO PARCIAL','NUEVO PAGO','RECUPERO')
+      and poliza IN (&FILTRO_BC_AUX)
+      and input(strip(estadomes),anydtdte7.0) <= &Fec_Cierre.
+      and FECHAOCURRENCIA >= '1Jan2020:0:0:0'dt
+    group by numero,
+             poliza,
+             riesgoactuarial,
+             riesgooperaciones,
+             socioactuarial,
+             Fec_Ocurre,
+             Mes_Estado
+    order by numero,
+             Fec_Ocurre,
+             Mes_Estado;
+quit;
+
+** Paso 1.1: Agrupamos por la minima fecha ocurrencia;
+
+proc sql;
+    create table base_aux_pagados_2 as
+    select  numero,
+            rutasegurado,
+            dvasegurado,
+            sum(montobruto) format=commax20.0 as montobruto,
+            sum(totalcuotas) format=commax20.0 as totalcuotas
+    from base_aux_pagados_1
+    group by numero;
+quit;
+
+** Paso 1.2: UNIMOS DATOS RELEVANTES DE LA TABLA 2 CON 1;
+
+proc sql;
+    create table base_aux_pagados_3 as
+    select  t1.numero,
+            t1.rutasegurado,
+            t1.dvasegurado,
+            t1.poliza,
+            t1.riesgoactuarial,
+            t1.riesgooperaciones,
+            t1.detalleresolucion,
+            t1.agrupaciondetalleresolucion,
+            t1.socioactuarial,
+            t2.totalcuotas,
+            t2.montobruto
+    from base_aux_pagados_1 t1
+    left join base_aux_pagados_2 t2
+        on (t1.numero = t2.numero);
+quit;
+
+proc sql;
+    create table Pagados as
+    select  t1.numero,
+            t1.rutasegurado,
+            t1.dvasegurado,
+            t1.poliza,
+            t1.riesgoactuarial,
+            t1.riesgooperaciones,
+            t1.detalleresolucion,
+            t1.agrupaciondetalleresolucion,
+            t1.socioactuarial,
+            t2.Fec_Otorgamiento,
+            t2.Fec_Ocurre,
+            t2.Fec_Nacimiento,
+            t2.Min_Mes_Estado,
+            t1.montobruto,
+            t1.totalcuotas
+    from base_aux_pagados_3 t1
+    left join base_madre_2 t2
+        on (t1.numero = t2.numero);
+quit;
+
+proc sort nodupkey;
+    by numero;
+run;
+
+proc sql;
+    alter table Pagados
+    add type char format=$char6.;
+    update Pagados
+    set type='PAG';
+quit;
+
+data Siniestros_Control (sorteby=numero Fec_ocurre Min_Mes_Estado);
+    set Pagados;
+run;
+
+PROC SQL;
+CREATE TABLE Siniestros_Fin AS
+SELECT  t1.NUMERO,
+        t1.rutasegurado,
+        t1.dvasegurado,
+        t1.POLIZA,
+        t1.RIESGOACTUARIAL,
+        t1.riesgooperaciones,
+        t1.detalleresolucion,
+        t1.agrupaciondetalleresolucion,
+        t1.SOCIOACTUARIAL,
+        (MIN(t1.Fec_Otorgamiento)) FORMAT=DDMMYY10. AS MIN_of_Fec_Otorgamiento,
+        (MIN(t1.Fec_Ocurre))       FORMAT=DDMMYY10. AS MIN_of_Fec_Ocurre,
+        (MIN(t1.Fec_Nacimiento))   FORMAT=DDMMYY10. AS MIN_of_Fec_Nacimiento,
+        (MIN(t1.Min_Mes_Estado))   FORMAT=DDMMYY10. AS MIN_of_Mes_Estado,
+        (SUM(t1.montobruto))       FORMAT=COMMAX20. AS SUM_of_montobruto,
+        (SUM(t1.totalcuotas))      FORMAT=COMMAX20. AS SUM_of_totalcuotas
+FROM Siniestros_Control t1
+GROUP BY t1.NUMERO,
+         t1.rutasegurado,
+         t1.dvasegurado,
+         t1.POLIZA,
+         t1.RIESGOACTUARIAL,
+         t1.riesgooperaciones,
+         t1.SOCIOACTUARIAL;
+QUIT;
+
+data BASE_PAGADOS;
+    set WORK.Siniestros_Fin;
+
+    YEAR = YEAR(MIN_of_Fec_Ocurre);
+    fec_ocurre = intnx('month',MIN_of_Fec_Ocurre,0,'b');
+    format fec_ocurre ddmmyy10.;
+
+    if SUM_of_montobruto <= 100000 then AGRUPACION = 'Menor a 100.000';
+    else AGRUPACION = 'Mayor a 100.000';
+
+    COD = 'PAG';
+run;
+
+proc sort nodupkey;
+    by numero;
+run;
+
+PROC SQL;
+CREATE TABLE WORK.AGRUPADOS_PAGADOS_AUX AS
+SELECT  t1.POLIZA,
+        t1.YEAR,
+        t1.MIN_of_Fec_Ocurre FORMAT DDMMYY10. AS Fec_Ocurre,
+        t1.MIN_of_Fec_Otorgamiento FORMAT=DDMMYY10. AS Fec_Otorgamiento,
+        t1.AGRUPACION,
+        t1.NUMERO,
+        t1.rutasegurado,
+        t1.dvasegurado,
+        t1.RIESGOACTUARIAL,
+        t1.riesgooperaciones,
+        t1.SOCIOACTUARIAL,
+        t1.COD,
+        t1.detalleresolucion,
+        t1.agrupaciondetalleresolucion,
+        t1.MIN_of_Mes_Estado as mes_estado,
+        (COUNT(t1.NUMERO)) AS COUNT_NUMERO,
+        (SUM(t1.SUM_of_montobruto)) AS SUM_MONTO
+FROM WORK.BASE_PAGADOS t1
+GROUP BY t1.POLIZA,
+         t1.YEAR,
+         t1.MIN_of_Fec_Ocurre,
+         t1.MIN_of_Fec_Otorgamiento,
+         t1.AGRUPACION,
+         t1.NUMERO,
+         t1.rutasegurado,
+         t1.dvasegurado,
+         t1.RIESGOACTUARIAL,
+         t1.riesgooperaciones,
+         t1.SOCIOACTUARIAL,
+         t1.COD,
+         t1.detalleresolucion,
+         t1.agrupaciondetalleresolucion,
+         t1.MIN_of_Mes_Estado;
+QUIT;
+
+proc datasets library=work;
+delete base_madrePag base_madre_2 base_aux_pagados_1 base_aux_pagados_2
+       base_aux_pagados_3 Pagados Siniestros_Control Siniestros_Fin;
+run;
+
+proc sql;
+    create table base_madre as
+    select  numero,
+            rutasegurado,
+            dvasegurado,
+            estadocuota,
+            poliza,
+            riesgoactuarial,
+            riesgooperaciones,
+            detalleresolucion,
+            agrupaciondetalleresolucion,
+            socioactuarial,
+            intnx('month',datepart(fechaocurrencia),0,'s')  format=ddmmyy10. as Fec_Ocurre,
+            intnx('month',datepart(fechaotorgamiento),0,'s') format=ddmmyy10. as Fec_Otorgamiento,
+            intnx('month',datepart(aseguradofecanc),0,'s')   format=ddmmyy10. as Fec_Nacimiento,
+            input(strip(estadomes),anydtdte7.0)              format=ddmmyy10. as Mes_Estado,
+            totalcuotas                                       format=comma20.0 as totalcuotas,
+            montobruto                                        format=comma20.0 as montobruto
+    from LIB1.ACT_BASE_SINIESTRO
+    where poliza IN (&FILTRO_BC_AUX)
+    and input(strip(estadomes),anydtdte7.0) <= &Fec_Cierre.
+    and FECHAOCURRENCIA >= '1Jan2020:0:0:0'dt
+    group by numero,
+             poliza,
+             riesgoactuarial,
+             riesgooperaciones,
+             socioactuarial,
+             Fec_Ocurre,
+             Mes_Estado
+    order by numero,
+             Fec_ocurre,
+             Mes_Estado;
+quit;
+
+/*
+DATA WORK.BASE_MADRE;
+SET WORK.BASE_MADRE;
+
+IF ESTADOCUOTA = 'PAGO FUTURO' AND Mes_Estado = '1Mar2023'd THEN DELETE;
+
+RUN;
+*/
+
+PROC SQL;
+    CREATE TABLE WORK.BASE_MADRE_AUX AS
+    SELECT  t1.NUMERO,
+            t1.RUTASEGURADO,
+            t1.DVASEGURADO,
+            t1.ESTADOCUOTA,
+            t1.POLIZA,
+            t1.RIESGOACTUARIAL,
+            t1.RIESGOOPERACIONES,
+            t1.DETALLERESOLUCION,
+            t1.AGRUPACIONDETALLERESOLUCION,
+            t1.SOCIOACTUARIAL,
+            t1.Fec_Ocurre,
+            t1.Fec_Otorgamiento,
+            t1.Fec_Nacimiento,
+            t1.Mes_Estado,
+            t1.totalcuotas AS SUM_of_totalcuotas,
+            t1.montobruto,
+            t2.COD
+    FROM WORK.BASE_MADRE t1
+    LEFT JOIN WORK.BASE_PAGADOS t2 ON (t1.numero = t2.numero);
+QUIT;
+
+data WORK.BASE_MADRE_AUX2;
+set WORK.BASE_MADRE_AUX;
+
+IF COD = 'PAG'
+THEN DELETE;
+
+RUN;
+
+PROC SORT DATA=WORK.BASE_MADRE_AUX2;
+BY numero mes_estado montobruto;
+RUN;
+
+data work.siniestros_last siniestros_others;
+set work.base_madre_aux2;
+by numero;
+if last.numero then Max_Mes_Estado=mes_estado;
+if Max_Mes_Estado ne . then output siniestros_last;
+else output siniestros_others;
+
+format Max_Mes_Estado ddmmyy10.;
+run;
+
+DATA WORK.RECHAZADOS_AUX1;
+SET WORK.SINIESTROS_LAST;
+
+Desfase_mes_estado = intnx('month',&Fec_Cierre.,-&Desfase_Pendientes.,'s');
+format Desfase_mes_estado ddmmyy10.;
+
+IF ESTADOCUOTA IN ('PENDIENTE','PAGO FUTURO') AND Mes_Estado >= Desfase_mes_estado THEN RECHAZADO = 'NO';
+ELSE RECHAZADO = 'SI';
+
+YEAR = YEAR(Fec_Ocurre);
+
+if montobruto <= 100000 then AGRUPACION = 'Menor a 100.000';
+ELSE AGRUPACION = 'Mayor a 100.000';
+
+COD = 'REC';
+
+RUN;
+
+PROC SQL;
+    CREATE TABLE WORK.AGRUPADOS_RECHAZADOS_AUX AS
+    SELECT  t1.POLIZA,
+            t1.YEAR,
+            t1.Fec_Ocurre,
+            t1.Fec_otorgamiento,
+            t1.AGRUPACION,
+            t1.NUMERO,
+            t1.rutasegurado,
+            t1.dvasegurado,
+            t1.RIESGOACTUARIAL,
+            t1.riesgooperaciones,
+            t1.SOCIOACTUARIAL,
+            t1.AGRUPACIONDETALLERESOLUCION,
+            t1.mes_estado,
+            (count(t1.NUMERO)) AS COUNT_NUMERO,
+            (SUM(t1.montobruto)) AS SUM_MONTO
+    FROM WORK.RECHAZADOS_AUX1 t1
+    GROUP BY t1.POLIZA,
+             t1.YEAR,
+             t1.Fec_Ocurre,
+             t1.Fec_otorgamiento,
+             t1.AGRUPACION,
+             t1.NUMERO,
+             t1.rutasegurado,
+             t1.dvasegurado,
+             t1.RIESGOACTUARIAL,
+             t1.riesgooperaciones,
+             t1.SOCIOACTUARIAL,
+             t1.AGRUPACIONDETALLERESOLUCION,
+             t1.mes_estado;
+QUIT;
+
+DATA WORK.AGRUPADOS;
+SET WORK.AGRUPADOS_RECHAZADOS_AUX WORK.AGRUPADOS_PAGADOS_AUX;
+
+if length(strip(put(rutasegurado,$10.)))=7 then
+RUT = '00' || strip(put(rutasegurado,$10.)) || strip(dvasegurado);
+if length(strip(put(rutasegurado,$10.)))=8 then
+RUT = '0' || strip(put(rutasegurado,$10.)) || strip(dvasegurado);
+if length(strip(put(rutasegurado,$10.)))=6 then
+RUT = '000' || strip(put(rutasegurado,$10.)) || strip(dvasegurado);
+if length(strip(put(rutasegurado,$10.)))=5 then
+RUT = '0000' || strip(put(rutasegurado,$10.)) || strip(dvasegurado);
+if rutasegurado = '' then
+RUT = rutasegurado;
+
+RUN;
+
+PROC SQL;
+CREATE TABLE WORK.DW_SINIESTROS_AUX2 AS
+SELECT  T1.*,
+        T2.SUM_MONTO,
+        T2.COD,
+        T2.mes_estado,
+        CASE WHEN T1.POLIZA_MADRE = '' THEN T2.POLIZA ELSE T1.POLIZA_MADRE END AS POLIZA_FINAL,
+        CASE WHEN T1.RUT_ASEGURADO = '' THEN T2.RUT ELSE T1.RUT_ASEGURADO END AS RUT_FINAL,
+        CASE WHEN T1.NUMERO_SIN = '' THEN T2.NUMERO ELSE T1.NUMERO_SIN END AS NUMERO_FINAL,
+        CASE WHEN T1.FEC_INIC_VIG_SEGURO = . THEN T2.FEC_OTORGAMIENTO ELSE T1.FEC_INIC_VIG_SEGURO END format=ddmmyy10. AS FEC_OTORGAMIENTO_FINAL,
+        CASE WHEN T1.FEC_OCURRENCIA = . THEN T2.FEC_OCURRE ELSE T1.FEC_OCURRENCIA END format=ddmmyy10. AS FEC_OCURRENCIA_FINAL,
+        CASE WHEN T1.COD_COB_CHIPSY = '' THEN T2.RIESGOOPERACIONES ELSE T1.COD_COB_CHIPSY END AS RIESGO_OPERACIONES_FINAL,
+        CASE WHEN T1.COD_COB_ACTUARIAL = '' THEN T2.RIESGOACTUARIAL ELSE T1.COD_COB_ACTUARIAL END AS RIESGO_ACTUARIAL_FINAL,
+        CASE WHEN T1.CAUSA = '' THEN T2.AGRUPACIONDETALLERESOLUCION ELSE T1.CAUSA END AS CAUSA_FINAL,
+        CASE WHEN T1.CAUSA_DETALLE = '' THEN T2.DETALLERESOLUCION ELSE T1.CAUSA_DETALLE END AS CAUSA_DETALLE_FINAL
+FROM WORK.DW_SINIESTROS_AUX1 T1
+FULL OUTER JOIN WORK.AGRUPADOS T2 ON T1.NUMERO_SIN = T2.NUMERO;
+QUIT;
+
+PROC SQL;
+CREATE TABLE WORK.DW_SINIESTROS_AUX3 AS
+SELECT T2.*
+FROM WORK.DW_SINIESTROS_AUX1 T1
+LEFT JOIN CLSNCPOP.DW_SINIESTROS_PAGO T2 ON T1.ID=T2.ID;
+QUIT;
+
+PROC SQL;
+CREATE TABLE WORK.DW_SINIESTROS_AUX4 AS
+SELECT  T1.ID,
+        (SUM(t1.MONTO_PESOS)) FORMAT=14.2 AS SUM_of_MONTO_PESOS,
+        (MIN(t1.FEC_PAGO)) FORMAT=DATETIME22.3 AS MIN_of_FEC_PAGO
+FROM WORK.DW_SINIESTROS_AUX3 T1
+GROUP BY T1.ID;
+QUIT;
+
+PROC SQL;
+CREATE TABLE WORK.DW_SINIESTROS_AUX5 AS
+SELECT  t1.RUT_FINAL,
+        (count(t1.NUMERO_FINAL)) AS COUNT_of_NUMERO_FINAL
+FROM WORK.DW_SINIESTROS_AUX2 t1
+GROUP BY t1.RUT_FINAL;
+QUIT;
+
+PROC SQL;
+CREATE TABLE WORK.DW_SINIESTROS_AUX6 AS
+SELECT DISTINCT t1.RUT_FINAL,
+       T2.RUT_RELACIONADO,
+       T3.NUMERO_FINAL
+FROM WORK.DW_SINIESTROS_AUX2 t1
+LEFT JOIN CLSNCPOP.DW_PER_RELACION T2 ON T1.RUT_FINAL=T2.RUT_PRINCIPAL
+LEFT JOIN WORK.DW_SINIESTROS_AUX2 T3 ON T2.RUT_RELACIONADO = T3.RUT_FINAL
+WHERE T3.NUMERO_FINAL <> '';
+QUIT;
+
+PROC SQL;
+CREATE TABLE WORK.DW_SINIESTROS_AUX7 AS
+SELECT t1.RUT_FINAL,
+       COUNT(t1.NUMERO_FINAL) AS CUENTA_SIN_FAMILIAR
+FROM WORK.DW_SINIESTROS_AUX6 t1
+GROUP BY t1.RUT_FINAL;
+QUIT;
+
+PROC SQL;
+CREATE TABLE WORK.DW_SINIESTROS_AUX8 AS
+SELECT  t1.*,
+        t2.SUM_of_MONTO_PESOS,
+        CASE WHEN t2.MIN_of_FEC_PAGO = . THEN t1.MES_ESTADO ELSE datepart(t2.MIN_of_FEC_PAGO) END FORMAT=DDMMYY10. AS FEC_PAGO,
+        t2.MIN_of_FEC_PAGO,
+        t3.RIESGO
+FROM WORK.DW_SINIESTROS_AUX2 t1
+LEFT JOIN WORK.DW_SINIESTROS_AUX4 t2 ON T1.ID=T2.ID
+LEFT JOIN LIB1.ACT_RIESGO t3 ON T1.RIESGO_OPERACIONES_FINAL = T3.RIESGOOPERACIONES
+LEFT JOIN WORK.DW_SINIESTROS_AUX5 t4 ON T1.RUT_FINAL=t4.RUT_FINAL
+LEFT JOIN WORK.DW_SINIESTROS_AUX7 t5 ON T1.RUT_FINAL=t5.RUT_FINAL
+LEFT JOIN WORK.'Investigaciones Robo'n t6 ON t6.NumeroSiniestro = t1.NUMERO_FINAL
+LEFT JOIN WORK.RUT_SOSPECHOSOS_DICTAMEN_APROB t7 ON T1.RUT_FINAL=T7.RUT_FINAL;
+QUIT;
+
+DATA WORK.DW_SINIESTROS_AUX9;
+SET WORK.DW_SINIESTROS_AUX8;
+
+IF SUM_MONTO IN (0,.) THEN MONTO_FINAL= SUM_of_MONTO_PESOS;
+ELSE MONTO_FINAL = SUM_MONTO;
+
+DIF_VIGENCIA = intck("day",FEC_OTORGAMIENTO_FINAL,FEC_OCURRENCIA_FINAL);
+RUN;
+
+DATA WORK.DW_SINIESTROS_AUX9;
+SET WORK.DW_SINIESTROS_AUX8;
+
+IF SUM_MONTO IN (0, .) THEN MONTO_FINAL = SUM_of_MONTO_PESOS;
+ELSE MONTO_FINAL = SUM_MONTO;
+
+DIF_VIGENCIA = intck("day", FEC_OTORGAMIENTO_FINAL, FEC_OCURRENCIA_FINAL);
+
+IF DIF_VIGENCIA < 31 THEN SOSPECHA1 = 1;
+ELSE SOSPECHA1 = 0;
+
+IF COUNT_OF_NUMERO_FINAL > 1 THEN SOSPECHA2 = 1;
+ELSE SOSPECHA2 = 0;
+
+IF CUENTA_SIN_FAMILIAR_AUX > 0 THEN SOSPECHA3 = 1;
+ELSE SOSPECHA3 = 0;
+
+IF find(DES_PLAN,'TRADICIONAL') THEN PLAN_AUX='PLAN TRADICIONAL';
+ELSE IF find(DES_PLAN,'PLAN 1') OR find(DES_PLAN,'PLAN1') OR find(DES_PLAN,'FIRST') THEN PLAN_AUX='PLAN 1';
+ELSE IF find(DES_PLAN,'PLAN 2') OR find(DES_PLAN,'PLAN2') OR find(DES_PLAN,'SECOND') THEN PLAN_AUX='PLAN 2';
+ELSE IF find(DES_PLAN,'PLAN 3') OR find(DES_PLAN,'PLAN3') THEN PLAN_AUX='PLAN 3';
+ELSE IF find(DES_PLAN,'PREFERENTE') THEN PLAN_AUX='PLAN PREFERENTE';
+ELSE IF find(DES_PLAN,'PREMIUM') THEN PLAN_AUX='PLAN PREMIUM';
+ELSE IF find(DES_PLAN,'UNICO') THEN PLAN_AUX='PLAN UNICO';
+ELSE PLAN_AUX=DES_PLAN;
+
+IF PLAN_AUX = 'PLAN 1' AND POLIZA_FINAL IN ('123037525','123037526') THEN PLAN_AUX = 'PLAN TRADICIONAL';
+
+IF find(RIESGOSDSC,'COMPRA PROTEGIDA X DAÑO ACCIDENTAL') THEN COB='COMPRA PROTEGIDA X DAÑO ACCIDENTAL';
+ELSE IF find(RIESGOSDSC,'COMPRA') THEN COB='COMPRA PROTEGIDA X ROBO';
+ELSE IF find(RIESGOSDSC,'EXTORSION') THEN COB='EXTORSION O ENGAÑO';
+ELSE IF find(RIESGOSDSC,'PROT PAT') OR find(RIESGOSDSC,'PROTEC PATRIM') OR FIND(RIESGOSDSC,'PROTECCION PATRIMONIAL') OR FIND(RIESGOSDSC,'P.P.') THEN COB='ROBO DOCUMENTOS';
+ELSE IF find(RIESGOSDSC,'CHEQ') THEN COB='ROBO CHEQUES';
+ELSE IF find(RIESGOSDSC,'INTIMID') THEN COB='ROBO COSAS';
+ELSE IF find(RIESGOSDSC,'VENTANILLA') THEN COB='ROBO DINERO CAJERO';
+ELSE IF find(RIESGOSDSC,'CAJEROS') OR find(RIESGOSDSC,'C.A') THEN COB='ROBO DINERO VENTANILLA';
+ELSE COB=RIESGOSDSC;
+
+IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 1' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 15;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 2' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 20;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 3' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 30;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 1' AND COB = 'EXTORSION O ENGAÑO' THEN TOPE = 13;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 1' AND COB = 'ROBO DOCUMENTOS' THEN TOPE = 1000;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 2' AND COB = 'ROBO DOCUMENTOS' THEN TOPE = 1500;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 3' AND COB = 'ROBO DOCUMENTOS' THEN TOPE = 2000;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 2' AND COB = 'EXTORSION O ENGAÑO' THEN TOPE = 20;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 3' AND COB = 'EXTORSION O ENGAÑO' THEN TOPE = 30;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 1' AND COB = 'ROBO COSAS' THEN TOPE = 8;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 2' AND COB = 'ROBO COSAS' THEN TOPE = 10;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 3' AND COB = 'ROBO COSAS' THEN TOPE = 15;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX IN ('PLAN 1','PLAN 2','PLAN 3') AND COB = 'ROBO DINERO CAJERO' THEN TOPE = 200;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX IN ('PLAN 1','PLAN 2','PLAN 3') AND COB = 'ROBO CHEQUES' THEN TOPE = 1000;
+ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX IN ('PLAN 1','PLAN 2','PLAN 3') AND COB = 'ROBO DINERO VENTANILLA' THEN TOPE = 50;
+
+ELSE IF POLIZA_FINAL='121107467' AND PLAN_AUX = 'PLAN 1' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 100;
+ELSE IF POLIZA_FINAL='121107467' AND PLAN_AUX = 'PLAN 2' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 200;
+ELSE IF POLIZA_FINAL='121107467' AND PLAN_AUX = 'PLAN 1' AND COB = 'ROBO COSAS' THEN TOPE = 6.5;
+ELSE IF POLIZA_FINAL='121107467' AND PLAN_AUX = 'PLAN 2' AND COB = 'ROBO COSAS' THEN TOPE = 10;
+ELSE IF POLIZA_FINAL='121107467' AND PLAN_AUX = 'PLAN 1' AND COB IN ('ROBO DINERO CAJERO','ROBO DINERO VENTANILLA') THEN TOPE = 15;
+ELSE IF POLIZA_FINAL='121107467' AND PLAN_AUX = 'PLAN 2' AND COB IN ('ROBO DINERO CAJERO','ROBO DINERO VENTANILLA') THEN TOPE = 20;
+
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN PREFERENTE' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 20;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN PREMIUM' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 30;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN TRADICIONAL' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 15;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN TRADICIONAL' AND COB = 'EXTORSION O ENGAÑO' THEN TOPE = 10;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN PREFERENTE' AND COB = 'EXTORSION O ENGAÑO' THEN TOPE = 15;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN PREMIUM' AND COB = 'EXTORSION O ENGAÑO' THEN TOPE = 20;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN PREMIUM' AND COB = 'ROBO DOCUMENTOS' THEN TOPE = 15;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN PREFERENTE' AND COB = 'ROBO DOCUMENTOS' THEN TOPE = 10;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN TRADICIONAL' AND COB = 'ROBO DOCUMENTOS' THEN TOPE = 8;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN PREMIUM' AND COB = 'ROBO COSAS' THEN TOPE = 15;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN TRADICIONAL' AND COB = 'ROBO COSAS' THEN TOPE = 8;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX = 'PLAN PREFERENTE' AND COB = 'ROBO COSAS' THEN TOPE = 10;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX IN ('PLAN TRADICIONAL','PLAN PREMIUM','PLAN PREFERENTE') AND COB = 'ROBO DINERO CAJERO' THEN TOPE = 50;
+ELSE IF POLIZA_FINAL IN ('123037525','123037526') AND PLAN_AUX IN ('PLAN TRADICIONAL','PLAN PREMIUM','PLAN PREFERENTE') AND COB = 'ROBO DINERO VENTANILLA' THEN TOPE = 200;
+
+ELSE IF POLIZA_FINAL IN ('124097627','124097628') AND PLAN_AUX IN ('PLAN 1') AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 50;
+ELSE IF POLIZA_FINAL IN ('124097627','124097628') AND PLAN_AUX IN ('PLAN 2') AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 100;
+
+ELSE TOPE = MONTO_COBERTURA;
+
+RUN;
+
+PROC SQL;
+CREATE TABLE WORK.DW_SINIESTROS_AUX10 AS
+SELECT DISTINCT t1.*, T8.VALOR
+FROM WORK.DW_SINIESTROS_AUX9 t1
+LEFT JOIN LIB1.ACT_UF T8 ON T1.FEC_PAGO = DATEPART(T8.FECHA)
+;
+QUIT;
+
+DATA WORK.DW_SINIESTROS_AUX11;
+SET WORK.DW_SINIESTROS_AUX10;
+
+MONTO_FINAL_UF= MONTO_FINAL/VALOR;
+USO_TOPE=MONTO_FINAL_UF/TOPE;
+
+IF USO_TOPE >= 0.8 THEN SOSPECHA4=1;
+ELSE SOSPECHA4=0;
+
+SOSPECHA_FINAL= SUM(SOSPECHA1,SOSPECHA2,SOSPECHA3,SOSPECHA4);
+
+RUN;
+
+libname Salidas "/sasdata/Proyectos";
+
+DATA SALIDAS.ROBO_ENERO2025;
+SET WORK.DW_SINIESTROS_AUX11;
+RUN;
+
+proc export
+data= WORK.DW_SINIESTROS_AUX11
+dbms=XLSX
+outfile= "/sasdata/Proyectos/Estudios/ROBO_FEB2025"
+replace;
+SHEET="INPUTsin_";
+run;
+
+/*DATA WORK.DW_SINIESTROS_AUX11;*/
+/*SET SALIDAS.ROBO_ENERO2025;*/
+/*RUN;*/
