@@ -1,0 +1,445 @@
+/*====================================================================*/
+/*  MODULO DE ENRIQUECIMIENTO - ANALISIS FRAUDE ROBO                  */
+/*  Input:  SALIDAS.ROBO_ENERO2025 (output del codigo del colega)     */
+/*  Output: SALIDAS.ROBO_ENRIQUECIDO                                  */
+/*  Autor:  Equipo Actuariado CA                                      */
+/*  Fecha:  Marzo 2026                                                */
+/*====================================================================*/
+/*  NOTAS:                                                            */
+/*  - Este modulo es INDEPENDIENTE del pipeline de siniestros.        */
+/*  - Toma la tabla final (AUX11) y agrega variables de               */
+/*    enriquecimiento para el analisis de fraude.                     */
+/*  - Variables nuevas:                                               */
+/*      > MEDIO_PAGO, CANAL_VENTA, SUCURSAL_VENTA (DW_SEGUROS)       */
+/*      > COMUNA, DIRECCION_COMPLETA (DW_PER_DIRE)                   */
+/*      > CANT_SEGUROS_12M_OCURR, CANT_SEGUROS_12M_JUL25 (DW_SEGUROS)*/
+/*      > CANT_SIN_OTRAS_COB (DW_SINIESTROS)                         */
+/*      > GLOSA_GIRO (DW_PER_GIRO)                                   */
+/*  PREREQUISITO: La macro variable FILTRO_BC_AUX debe estar          */
+/*  definida (se genera en el codigo del colega al inicio).           */
+/*====================================================================*/
+
+/* Ajustar libname segun tu entorno */
+libname Salidas "/sasdata/Proyectos";
+
+/*--------------------------------------------------------------------*/
+/* PASO 0: Cargar base input                                          */
+/*--------------------------------------------------------------------*/
+/* Si ya tienes DW_SINIESTROS_AUX11 en WORK, reemplaza el SET        */
+
+DATA WORK.BASE_ENRIQ;
+SET SALIDAS.ROBO_ENERO2025;
+RUN;
+
+PROC SQL NOPRINT;
+    SELECT COUNT(*) INTO :N_BASE FROM WORK.BASE_ENRIQ;
+QUIT;
+%PUT >>> BASE INPUT: &N_BASE registros;
+
+
+/*====================================================================*/
+/* PASO 1: CRUCE CON DW_SEGUROS                                      */
+/*         Variables: MEDIO_PAGO, CANAL_VENTA, SUCURSAL_VENTA        */
+/*====================================================================*/
+/* FEC_OTORGAMIENTO_FINAL esta truncada al 1er dia del mes            */
+/* FEC_VIGENCIA en DW_SEGUROS es datetime exacta                      */
+/* => Truncamos FEC_VIGENCIA al mes para que matchee                  */
+/* Llaves: RUT + POLIZA + MES_VIGENCIA                                */
+/*--------------------------------------------------------------------*/
+
+PROC SQL;
+CREATE TABLE WORK.SEGUROS_AUX AS
+SELECT  T1.RUT_TITULAR,
+        T1.POLIZA_MADRE,
+        intnx('month', datepart(T1.FEC_VIGENCIA), 0, 's')
+            FORMAT=DDMMYY10. AS FEC_VIG_MES,
+        T1.MEDIO_PAGO,
+        T1.CANAL_VENTA,
+        T1.SUCURSAL_VENTA,
+        T1.DES_PRODUCTO,
+        T1.DES_PLAN,
+        T1.ESTADO AS ESTADO_SEGURO,
+        datepart(T1.FEC_VENTA) FORMAT=DDMMYY10. AS FEC_VENTA_DATE,
+        datepart(T1.FEC_VIGENCIA) FORMAT=DDMMYY10. AS FEC_VIGENCIA_DATE,
+        datepart(T1.FEC_VENCIMIENTO) FORMAT=DDMMYY10. AS FEC_VENCIMIENTO_DATE
+FROM CLSNCPOP.DW_SEGUROS T1
+WHERE T1.POLIZA_MADRE IN (&FILTRO_BC_AUX)
+;
+QUIT;
+
+/* ---- CONTROL DE DUPLICADOS ---- */
+PROC SQL;
+CREATE TABLE WORK.CHECK_DUPL_SEG AS
+SELECT  A.RUT_FINAL,
+        A.POLIZA_FINAL,
+        A.FEC_OTORGAMIENTO_FINAL,
+        COUNT(*) AS N_MATCH
+FROM WORK.BASE_ENRIQ A
+INNER JOIN WORK.SEGUROS_AUX B
+    ON A.RUT_FINAL = B.RUT_TITULAR
+    AND A.POLIZA_FINAL = B.POLIZA_MADRE
+    AND A.FEC_OTORGAMIENTO_FINAL = B.FEC_VIG_MES
+GROUP BY A.RUT_FINAL, A.POLIZA_FINAL, A.FEC_OTORGAMIENTO_FINAL
+HAVING COUNT(*) > 1
+;
+QUIT;
+
+PROC SQL NOPRINT;
+    SELECT COUNT(*) INTO :N_DUPL_SEG FROM WORK.CHECK_DUPL_SEG;
+QUIT;
+%PUT >>> DUPLICADOS EN CRUCE DW_SEGUROS: &N_DUPL_SEG;
+/* Si N_DUPL_SEG > 0, revisar CHECK_DUPL_SEG manualmente */
+
+/* ---- CRUCE EFECTIVO ---- */
+PROC SQL;
+CREATE TABLE WORK.ENRIQ_01 AS
+SELECT  A.*,
+        B.MEDIO_PAGO,
+        B.CANAL_VENTA,
+        B.SUCURSAL_VENTA,
+        B.ESTADO_SEGURO,
+        B.FEC_VENTA_DATE,
+        B.FEC_VIGENCIA_DATE,
+        B.FEC_VENCIMIENTO_DATE
+FROM WORK.BASE_ENRIQ A
+LEFT JOIN WORK.SEGUROS_AUX B
+    ON A.RUT_FINAL = B.RUT_TITULAR
+    AND A.POLIZA_FINAL = B.POLIZA_MADRE
+    AND A.FEC_OTORGAMIENTO_FINAL = B.FEC_VIG_MES
+;
+QUIT;
+
+/* Match rate */
+PROC SQL NOPRINT;
+    SELECT COUNT(*) INTO :N_ENRIQ01 FROM WORK.ENRIQ_01;
+    SELECT COUNT(*) INTO :N_SIN_MATCH_SEG
+        FROM WORK.ENRIQ_01 WHERE MEDIO_PAGO = '' AND CANAL_VENTA = '';
+QUIT;
+%PUT >>> POST CRUCE DW_SEGUROS: &N_ENRIQ01 registros, &N_SIN_MATCH_SEG sin match;
+
+/* Desduplicar: tomar FEC_VENTA mas antigua en caso de duplicados */
+PROC SORT DATA=WORK.ENRIQ_01;
+    BY RUT_FINAL POLIZA_FINAL FEC_OTORGAMIENTO_FINAL NUMERO_FINAL FEC_VENTA_DATE;
+RUN;
+
+PROC SORT DATA=WORK.ENRIQ_01 NODUPKEY;
+    BY RUT_FINAL POLIZA_FINAL FEC_OTORGAMIENTO_FINAL NUMERO_FINAL;
+RUN;
+
+PROC SQL NOPRINT;
+    SELECT COUNT(*) INTO :N_POST_DEDUP FROM WORK.ENRIQ_01;
+QUIT;
+%PUT >>> POST DEDUP DW_SEGUROS: &N_POST_DEDUP registros (original: &N_BASE);
+
+
+/*====================================================================*/
+/* PASO 2: CRUCE CON DW_PER_DIRE                                     */
+/*         Variables: COMUNA, DIRECCION_COMPLETA                      */
+/*====================================================================*/
+/* Solo el ultimo registro por RUT (max FEC_ACT_REGISTRO)             */
+/*--------------------------------------------------------------------*/
+
+PROC SQL;
+CREATE TABLE WORK.PER_DIRE_ULTIMA AS
+SELECT  T1.PER_RUT,
+        T1.COMUNA,
+        T1.CALLE,
+        T1.NUMERO AS NUM_DIRE,
+        T1.TIPO_PROPIEDAD,
+        T1.NUMERO_PROPIEDAD,
+        T1.DIRECCION,
+        T1.RESTO_DIRECCION,
+        T1.FEC_ACT_REGISTRO
+FROM CLSNCPOP.DW_PER_DIRE T1
+INNER JOIN (
+    SELECT PER_RUT, MAX(FEC_ACT_REGISTRO) AS MAX_FEC
+    FROM CLSNCPOP.DW_PER_DIRE
+    GROUP BY PER_RUT
+) T2
+    ON T1.PER_RUT = T2.PER_RUT
+    AND T1.FEC_ACT_REGISTRO = T2.MAX_FEC
+;
+QUIT;
+
+/* Desduplicar empates en fecha */
+PROC SORT DATA=WORK.PER_DIRE_ULTIMA NODUPKEY;
+    BY PER_RUT;
+RUN;
+
+PROC SQL;
+CREATE TABLE WORK.ENRIQ_02 AS
+SELECT  A.*,
+        B.COMUNA,
+        CATX(' ', B.CALLE, B.NUM_DIRE, B.TIPO_PROPIEDAD,
+             B.NUMERO_PROPIEDAD, B.RESTO_DIRECCION) AS DIRECCION_COMPLETA,
+        B.DIRECCION AS DIRECCION_ORIGINAL
+FROM WORK.ENRIQ_01 A
+LEFT JOIN WORK.PER_DIRE_ULTIMA B
+    ON A.RUT_FINAL = B.PER_RUT
+;
+QUIT;
+
+PROC SQL NOPRINT;
+    SELECT COUNT(*) INTO :N_SIN_MATCH_DIRE
+        FROM WORK.ENRIQ_02 WHERE COMUNA = '';
+QUIT;
+%PUT >>> SIN MATCH COMUNA: &N_SIN_MATCH_DIRE de &N_BASE;
+
+
+/*====================================================================*/
+/* PASO 3: CANTIDAD DE SEGUROS CONTRATADOS                            */
+/*         Var 1: 12 meses antes de fecha ocurrencia (por siniestro)  */
+/*         Var 2: 12 meses antes de julio 2025 (fijo, por RUT)        */
+/*         Var 3: Seguros vigentes actualmente (bonus, por RUT)       */
+/*====================================================================*/
+/* Incluimos TODOS los estados porque queremos capturar comportamiento*/
+/* de contratacion, no solo seguros activos.                          */
+/*--------------------------------------------------------------------*/
+
+/* Var 1: ventana dinamica relativa a cada siniestro */
+PROC SQL;
+CREATE TABLE WORK.CANT_SEG_OCURR AS
+SELECT  A.RUT_FINAL,
+        A.NUMERO_FINAL,
+        COUNT(DISTINCT B.ID_SEGURO) AS CANT_SEGUROS_12M_OCURR
+FROM WORK.BASE_ENRIQ A
+LEFT JOIN CLSNCPOP.DW_SEGUROS B
+    ON A.RUT_FINAL = B.RUT_TITULAR
+    AND datepart(B.FEC_VIGENCIA) >= intnx('month', A.FEC_OCURRENCIA_FINAL, -12, 's')
+    AND datepart(B.FEC_VIGENCIA) <= A.FEC_OCURRENCIA_FINAL
+GROUP BY A.RUT_FINAL, A.NUMERO_FINAL
+;
+QUIT;
+
+/* Var 2: ventana fija Ago2024 - Jul2025 */
+PROC SQL;
+CREATE TABLE WORK.CANT_SEG_JUL25 AS
+SELECT  A.RUT_FINAL,
+        COUNT(DISTINCT B.ID_SEGURO) AS CANT_SEGUROS_12M_JUL25
+FROM (SELECT DISTINCT RUT_FINAL FROM WORK.BASE_ENRIQ) A
+LEFT JOIN CLSNCPOP.DW_SEGUROS B
+    ON A.RUT_FINAL = B.RUT_TITULAR
+    AND datepart(B.FEC_VIGENCIA) >= '01Aug2024'd
+    AND datepart(B.FEC_VIGENCIA) <= '31Jul2025'd
+GROUP BY A.RUT_FINAL
+;
+QUIT;
+
+/* Var 3: seguros en estado VIGENTE (sin restriccion temporal) */
+PROC SQL;
+CREATE TABLE WORK.CANT_SEG_VIGENTES AS
+SELECT  A.RUT_FINAL,
+        COUNT(DISTINCT B.ID_SEGURO) AS CANT_SEGUROS_VIGENTES
+FROM (SELECT DISTINCT RUT_FINAL FROM WORK.BASE_ENRIQ) A
+LEFT JOIN CLSNCPOP.DW_SEGUROS B
+    ON A.RUT_FINAL = B.RUT_TITULAR
+    AND STRIP(UPCASE(B.ESTADO)) = 'VIGENTE'
+GROUP BY A.RUT_FINAL
+;
+QUIT;
+
+/* Unir las tres variables de seguros */
+PROC SQL;
+CREATE TABLE WORK.ENRIQ_03 AS
+SELECT  A.*,
+        COALESCE(B.CANT_SEGUROS_12M_OCURR, 0) AS CANT_SEGUROS_12M_OCURR,
+        COALESCE(C.CANT_SEGUROS_12M_JUL25, 0) AS CANT_SEGUROS_12M_JUL25,
+        COALESCE(D.CANT_SEGUROS_VIGENTES, 0)  AS CANT_SEGUROS_VIGENTES
+FROM WORK.ENRIQ_02 A
+LEFT JOIN WORK.CANT_SEG_OCURR B
+    ON A.RUT_FINAL = B.RUT_FINAL AND A.NUMERO_FINAL = B.NUMERO_FINAL
+LEFT JOIN WORK.CANT_SEG_JUL25 C
+    ON A.RUT_FINAL = C.RUT_FINAL
+LEFT JOIN WORK.CANT_SEG_VIGENTES D
+    ON A.RUT_FINAL = D.RUT_FINAL
+;
+QUIT;
+
+
+/*====================================================================*/
+/* PASO 4: SINIESTROS EN OTRAS COBERTURAS                             */
+/*         Variable: CANT_SIN_OTRAS_COB                               */
+/*====================================================================*/
+/* Siniestros del mismo RUT en polizas fuera de FILTRO_BC_AUX         */
+/*--------------------------------------------------------------------*/
+
+PROC SQL;
+CREATE TABLE WORK.SIN_OTRAS_COB AS
+SELECT  T1.RUT_ASEGURADO,
+        COUNT(DISTINCT T1.NUMERO_SINIESTRO) AS CANT_SIN_OTRAS_COB
+FROM CLSNCPOP.DW_SINIESTROS T1
+WHERE T1.POLIZA_MADRE NOT IN (&FILTRO_BC_AUX)
+  AND T1.RUT_ASEGURADO IN (SELECT DISTINCT RUT_FINAL FROM WORK.BASE_ENRIQ)
+  AND T1.FEC_OCURRENCIA >= '1Jan2020'd
+GROUP BY T1.RUT_ASEGURADO
+;
+QUIT;
+
+PROC SQL;
+CREATE TABLE WORK.ENRIQ_04 AS
+SELECT  A.*,
+        COALESCE(B.CANT_SIN_OTRAS_COB, 0) AS CANT_SIN_OTRAS_COB
+FROM WORK.ENRIQ_03 A
+LEFT JOIN WORK.SIN_OTRAS_COB B
+    ON A.RUT_FINAL = B.RUT_ASEGURADO
+;
+QUIT;
+
+
+/*====================================================================*/
+/* PASO 5: GIRO COMERCIAL / ACTIVIDAD ECONOMICA                      */
+/*         Variable: GLOSA_GIRO                                       */
+/*====================================================================*/
+/* Multiples giros por RUT => tomamos el mas reciente por fecha       */
+/*--------------------------------------------------------------------*/
+
+PROC SQL;
+CREATE TABLE WORK.GIRO_AUX AS
+SELECT  T1.PER_RUT,
+        T1.GLOSA_GIRO,
+        T1.COD_GIRO,
+        T1.FECHA_PROVEEDOR
+FROM CLSNCPOP.DW_PER_GIRO T1
+WHERE T1.PER_RUT IN (SELECT DISTINCT RUT_FINAL FROM WORK.BASE_ENRIQ)
+;
+QUIT;
+
+PROC SORT DATA=WORK.GIRO_AUX;
+    BY PER_RUT DESCENDING FECHA_PROVEEDOR;
+RUN;
+
+PROC SORT DATA=WORK.GIRO_AUX NODUPKEY;
+    BY PER_RUT;
+RUN;
+
+PROC SQL;
+CREATE TABLE WORK.ENRIQ_05 AS
+SELECT  A.*,
+        B.GLOSA_GIRO,
+        B.COD_GIRO
+FROM WORK.ENRIQ_04 A
+LEFT JOIN WORK.GIRO_AUX B
+    ON A.RUT_FINAL = B.PER_RUT
+;
+QUIT;
+
+
+/*====================================================================*/
+/* PASO 6: VARIABLES DERIVADAS ADICIONALES                            */
+/*====================================================================*/
+/* Variables analiticas para PowerBI y modelo predictivo               */
+/*--------------------------------------------------------------------*/
+
+DATA WORK.ENRIQ_FINAL;
+SET WORK.ENRIQ_05;
+
+/* Edad al momento del siniestro */
+IF MIN_of_Fec_Nacimiento NE . AND FEC_OCURRENCIA_FINAL NE . THEN
+    EDAD_SINIESTRO = intck('year', MIN_of_Fec_Nacimiento, FEC_OCURRENCIA_FINAL);
+
+/* Dias entre fecha real de venta y ocurrencia */
+IF FEC_VENTA_DATE NE . AND FEC_OCURRENCIA_FINAL NE . THEN
+    DIAS_VENTA_OCURRENCIA = intck('day', FEC_VENTA_DATE, FEC_OCURRENCIA_FINAL);
+
+/* ZONA GRIS DIAS: 31-60 dias (evaden umbral <31 pero siniestran temprano) */
+IF DIF_VIGENCIA >= 31 AND DIF_VIGENCIA <= 60 THEN ZONA_GRIS_DIAS = 1;
+ELSE ZONA_GRIS_DIAS = 0;
+
+/* ZONA GRIS MONTO: 70%-79% del tope (evaden umbral >=80%) */
+IF USO_TOPE >= 0.70 AND USO_TOPE < 0.80 THEN ZONA_GRIS_MONTO = 1;
+ELSE ZONA_GRIS_MONTO = 0;
+
+/* Filtro periodo de analisis Ene2022 - Jul2025 */
+IF FEC_OCURRENCIA_FINAL >= '01Jan2022'd AND FEC_OCURRENCIA_FINAL <= '31Jul2025'd
+    THEN EN_PERIODO_ANALISIS = 1;
+ELSE EN_PERIODO_ANALISIS = 0;
+
+/* Indicador post agosto 2024 (quiebre del filtro) */
+IF FEC_OCURRENCIA_FINAL >= '01Aug2024'd THEN POST_AGO2024 = 1;
+ELSE POST_AGO2024 = 0;
+
+/* Descomposicion temporal */
+IF FEC_OCURRENCIA_FINAL NE . THEN DO;
+    ANIO_OCURR = YEAR(FEC_OCURRENCIA_FINAL);
+    MES_OCURR = MONTH(FEC_OCURRENCIA_FINAL);
+    TRIM_OCURR = QTR(FEC_OCURRENCIA_FINAL);
+    ANIO_MES_OCURR = PUT(ANIO_OCURR, 4.) || '-' || PUT(MES_OCURR, Z2.);
+END;
+
+/* Limpieza de variables categoricas */
+COMUNA_CLEAN = STRIP(UPCASE(COMUNA));
+CANAL_VENTA_CLEAN = STRIP(UPCASE(CANAL_VENTA));
+SUCURSAL_VENTA_CLEAN = STRIP(UPCASE(SUCURSAL_VENTA));
+MEDIO_PAGO_CLEAN = STRIP(UPCASE(MEDIO_PAGO));
+
+RUN;
+
+
+/*====================================================================*/
+/* PASO 7: RESUMEN DE CALIDAD DE ENRIQUECIMIENTO                     */
+/*====================================================================*/
+
+PROC SQL NOPRINT;
+    SELECT COUNT(*) INTO :N_FINAL FROM WORK.ENRIQ_FINAL;
+    SELECT COUNT(*) INTO :N_EN_PERIODO
+        FROM WORK.ENRIQ_FINAL WHERE EN_PERIODO_ANALISIS = 1;
+    SELECT COUNT(*) INTO :N_POST_AGO
+        FROM WORK.ENRIQ_FINAL WHERE POST_AGO2024 = 1;
+QUIT;
+%PUT >>> TABLA FINAL: &N_FINAL registros;
+%PUT >>> EN PERIODO ANALISIS (Ene22-Jul25): &N_EN_PERIODO;
+%PUT >>> POST AGOSTO 2024: &N_POST_AGO;
+
+PROC SQL;
+CREATE TABLE WORK.RESUMEN_CALIDAD AS
+SELECT
+    COUNT(*) AS TOTAL_REGISTROS,
+    SUM(CASE WHEN CANAL_VENTA NE '' THEN 1 ELSE 0 END) AS MATCH_CANAL,
+    SUM(CASE WHEN SUCURSAL_VENTA NE '' THEN 1 ELSE 0 END) AS MATCH_SUCURSAL,
+    SUM(CASE WHEN MEDIO_PAGO NE '' THEN 1 ELSE 0 END) AS MATCH_PAGO,
+    SUM(CASE WHEN COMUNA NE '' THEN 1 ELSE 0 END) AS MATCH_COMUNA,
+    SUM(CASE WHEN CANT_SEGUROS_12M_OCURR > 0 THEN 1 ELSE 0 END) AS CON_SEG_12M,
+    SUM(CASE WHEN CANT_SIN_OTRAS_COB > 0 THEN 1 ELSE 0 END) AS CON_SIN_OTRAS,
+    SUM(CASE WHEN GLOSA_GIRO NE '' THEN 1 ELSE 0 END) AS MATCH_GIRO,
+    SUM(ZONA_GRIS_DIAS) AS EN_ZONA_GRIS_DIAS,
+    SUM(ZONA_GRIS_MONTO) AS EN_ZONA_GRIS_MONTO
+FROM WORK.ENRIQ_FINAL
+WHERE EN_PERIODO_ANALISIS = 1
+;
+QUIT;
+
+TITLE "RESUMEN CALIDAD ENRIQUECIMIENTO";
+PROC PRINT DATA=WORK.RESUMEN_CALIDAD NOOBS; RUN;
+TITLE;
+
+
+/*====================================================================*/
+/* PASO 8: GUARDAR OUTPUT FINAL                                       */
+/*====================================================================*/
+
+DATA SALIDAS.ROBO_ENRIQUECIDO;
+SET WORK.ENRIQ_FINAL;
+RUN;
+
+PROC EXPORT
+    DATA=WORK.ENRIQ_FINAL
+    DBMS=XLSX
+    OUTFILE="/sasdata/Proyectos/Estudios/ROBO_ENRIQUECIDO"
+    REPLACE;
+    SHEET="INPUT_ENRIQ";
+RUN;
+
+%PUT >>> PROCESO FINALIZADO EXITOSAMENTE;
+
+
+/*====================================================================*/
+/* LIMPIEZA DE TABLAS TEMPORALES                                      */
+/*====================================================================*/
+
+PROC DATASETS LIBRARY=WORK NOLIST;
+DELETE  SEGUROS_AUX CHECK_DUPL_SEG PER_DIRE_ULTIMA
+        CANT_SEG_OCURR CANT_SEG_JUL25 CANT_SEG_VIGENTES
+        SIN_OTRAS_COB GIRO_AUX
+        ENRIQ_01 ENRIQ_02 ENRIQ_03 ENRIQ_04 ENRIQ_05
+        BASE_ENRIQ;
+RUN;
