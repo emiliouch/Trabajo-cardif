@@ -467,6 +467,35 @@ FROM WORK.DW_SINIESTROS_AUX1 T1
 FULL OUTER JOIN WORK.AGRUPADOS T2 ON T1.NUMERO_SIN = T2.NUMERO;
 QUIT;
 
+data work.DW_SINIESTROS_AUX2_KEY;
+    set work.DW_SINIESTROS_AUX2;
+    length RUT_NUM 8;
+
+    /* Si RUT_FINAL es numérico, lo usamos directo.
+       Si es char (con DV), tomamos los primeros 9 dígitos (con ceros) y lo pasamos a num. */
+    if vtype(RUT_FINAL) = 'N' then do;
+        RUT_NUM = RUT_FINAL;
+    end;
+    else do;
+        /* Limpia puntos/guiones/espacios y deja en mayúscula */
+        _rut_clean = upcase(compress(strip(RUT_FINAL), '-. '));
+        /* Parte numérica (9 chars con ceros a la izquierda) */
+        RUT_NUM = input(substr(_rut_clean, 1, 9), 9.);
+    end;
+
+    drop _rut_clean;
+run;
+
+data work.RUT_SOSPECHOSOS_DICTAMEN_APROB_KEY;
+    set work.RUT_SOSPECHOSOS_DICTAMEN_APROB;
+    length RUT_NUM 8;
+
+    _rut_clean = upcase(compress(strip(RUT_FINAL), '-. '));
+    RUT_NUM = input(substr(_rut_clean, 1, 9), 9.);
+
+    drop _rut_clean;
+run;
+
 PROC SQL;
 CREATE TABLE WORK.DW_SINIESTROS_AUX3 AS
 SELECT T2.*
@@ -510,7 +539,7 @@ FROM WORK.DW_SINIESTROS_AUX6 t1
 GROUP BY t1.RUT_FINAL;
 QUIT;
 
-PROC SQL;
+PPROC SQL;
 CREATE TABLE WORK.DW_SINIESTROS_AUX8 AS
 SELECT  t1.*,
         t2.SUM_of_MONTO_PESOS,
@@ -518,19 +547,20 @@ SELECT  t1.*,
         t2.MIN_of_FEC_PAGO,
         t3.RIESGODSC,
         t4.COUNT_of_NUMERO_FINAL,
-        CASE WHEN t5. CUENTA_SIN_FAMILIAR =. THEN 0 ELSE t5.CUENTA_SIN_FAMILIAR END AS CUENTA_SIN_FAMILIAR_AUX, t6.EstadoFraude,
+        CASE WHEN t5.CUENTA_SIN_FAMILIAR = . THEN 0 ELSE t5.CUENTA_SIN_FAMILIAR END AS CUENTA_SIN_FAMILIAR_AUX,
+        t6.EstadoFraude,
         t6.Resultado1,
         t6.FecResultado1,
         t6.Resultado2,
         t6.FecResultado2,
         t7.RUT_FINAL AS RUT_ALERTADO
-FROM WORK.DW_SINIESTROS_AUX2 t1
-LEFT JOIN WORK.DW_SINIESTROS_AUX4 t2 ON T1.ID=T2.ID
-LEFT JOIN LIB1.ACT_RIESGO t3 ON T1.RIESGO_OPERACIONES_FINAL = T3.RIESGOOPERACIONES
-LEFT JOIN WORK.DW_SINIESTROS_AUX5 t4 ON T1.RUT_FINAL=t4.RUT_FINAL
-LEFT JOIN WORK.DW_SINIESTROS_AUX7 t5 ON T1.RUT_FINAL=t5.RUT_FINAL
+FROM WORK.DW_SINIESTROS_AUX2_KEY t1
+LEFT JOIN WORK.DW_SINIESTROS_AUX4 t2 ON t1.ID=t2.ID
+LEFT JOIN LIB1.ACT_RIESGO t3 ON t1.RIESGO_OPERACIONES_FINAL = t3.RIESGOOPERACIONES
+LEFT JOIN WORK.DW_SINIESTROS_AUX5 t4 ON t1.RUT_FINAL=t4.RUT_FINAL
+LEFT JOIN WORK.DW_SINIESTROS_AUX7 t5 ON t1.RUT_FINAL=t5.RUT_FINAL
 LEFT JOIN WORK.'Investigaciones Robo'n t6 ON t6.NumeroSiniestro = t1.NUMERO_FINAL
-LEFT JOIN WORK.RUT_SOSPECHOSOS_DICTAMEN_APROB t7 ON T1.RUT_FINAL=T7.RUT_FINAL;
+LEFT JOIN WORK.RUT_SOSPECHOSOS_DICTAMEN_APROB_KEY t7 ON t1.RUT_NUM = t7.RUT_NUM;
 QUIT;
 
 DATA WORK.DW_SINIESTROS_AUX9;
