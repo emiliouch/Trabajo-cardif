@@ -1,455 +1,580 @@
-/*============================================================================*/
-/*  MODULO DE ENRIQUECIMIENTO - PROYECTO FRAUDE ROBO COMPRA PROTEGIDA        */
-/*  Autor: Equipo Actuariado CA                                               */
-/*  Fecha: Marzo 2026                                                         */
-/*  Input: WORK.DW_SINIESTROS_AUX11 (output del codigo base de siniestros)   */
-/*  Output: SALIDAS.ROBO_ENRIQUECIDA + export XLSX                           */
-/*                                                                            */
-/*  IMPORTANTE: Ejecutar DESPUES del codigo base que genera DW_SINIESTROS_AUX11*/
-/*  Este modulo NO modifica el pipeline original, solo enriquece su output.   */
-/*============================================================================*/
+//*==================================================================*/
+/* Input: SALIDAS.ROBO_ENERO2025 (output del pipeline de siniestros)*/
+/* Output: SALIDAS.ROBO_ENRIQUECIDA / Excel en /sasdata/Proyectos   */
+/* NOTA: Este modulo se ejecuta DESPUES del codigo principal de     */
+/* siniestros. No modifica las tablas intermedias del pipeline.     */
+/*==================================================================*/
 
-/* Parametros globales (deben coincidir con el codigo base) */
+/*------------------------------------------------------------------*/
+/* 0. PARAMETROS Y CARGA BASE                                       */
+/*------------------------------------------------------------------*/
+
+/* Reutilizamos las macro variables del codigo principal */
 %let Fec_Cierre = '31dec2025'd;
-%let Polizas = ('121107467', '123037525', '123037526', '121057429', '124097627', '124097628');
-%let Desfase_Pendientes = 0;
+%let Polizas = ('121107467', '123037525', '123037526', '121057429','124097627','124097628');
+%let Fec_Ref = '31dec2025'd; /* Fecha referencia para conteo de seguros */
 
 libname Salidas "/sasdata/Proyectos";
 
-/*============================================================================*/
-/*  PASO 1: DIRECCION - Ultima direccion registrada por RUT                   */
-/*  Fuente: CLSNCPOP.DW_PER_DIRE                                             */
-/*  Cruce: PER_RUT = RUT_FINAL                                               */
-/*  Filtro: Solo el registro mas reciente por RUT (max FEC_ACT_REGISTRO)      */
-/*                                                                            */
-/*  POR QUE: Necesitamos la comuna para detectar concentracion geografica.    */
-/*  Si los siniestros post 08-2024 se agrupan en comunas especificas,        */
-/*  es evidencia de red organizada o de un canal de venta comprometido        */
-/*  en esa zona.                                                              */
-/*============================================================================*/
+/* Cargamos la base final del pipeline de siniestros */
+DATA WORK.BASE_ENRICH;
+SET SALIDAS.ROBO_ENERO2025;
 
-/* 1a: Obtenemos la fecha mas reciente de cada RUT */
+/* Normalizamos RUT para todos los cruces posteriores:
+   - STRIP elimina espacios trailing (RUT_FINAL puede ser Char(11))
+   - UPCASE asegura consistencia en digito verificador (k vs K) */
+RUT_JOIN = UPCASE(STRIP(RUT_FINAL));
+
+/* Tambien normalizamos POLIZA para el cruce con DW_SEGUROS */
+POLIZA_JOIN = STRIP(POLIZA_FINAL);
+
+/* Truncamos FEC_OTORGAMIENTO_FINAL a mes para el cruce con DW_SEGUROS.
+   Esto es necesario porque FEC_OTORGAMIENTO_FINAL es una mezcla de
+   fechas exactas (de DW_SINIESTROS) y truncadas (de LIB1), asi que
+   llevamos todo a nivel mes para matchear consistentemente. */
+MES_OTORGAMIENTO = intnx('month', FEC_OTORGAMIENTO_FINAL, 0, 's');
+format MES_OTORGAMIENTO ddmmyy10.;
+
+RUN;
+
+/*------------------------------------------------------------------*/
+/* 1. DW_PER_DIRE: COMUNA Y DIRECCION (ULTIMO REGISTRO POR RUT)     */
+/*------------------------------------------------------------------*/
+/* Por que: Queremos detectar concentracion geografica de siniestros.
+   Si el pico post 08-2024 se concentra en comunas especificas,
+   es evidencia fuerte de red organizada o zona vulnerable.          */
+
+/* 1.1 Obtenemos la fecha maxima de registro por RUT */
 PROC SQL;
-CREATE TABLE WORK.ENR_DIRE_MAX_FECHA AS
-SELECT  PER_RUT,
-        MAX(FEC_ACT_REGISTRO) FORMAT=DATETIME22.3 AS MAX_FEC_REGISTRO
+CREATE TABLE WORK.PER_DIRE_MAX AS
+SELECT PER_RUT,
+       MAX(FEC_ACT_REGISTRO) format=DATETIME22.3 AS MAX_FEC_REG
 FROM CLSNCPOP.DW_PER_DIRE
 GROUP BY PER_RUT;
 QUIT;
 
-/* 1b: Traemos el registro completo asociado a esa fecha maxima */
+/* 1.2 Traemos el registro completo de la ultima actualizacion */
 PROC SQL;
-CREATE TABLE WORK.ENR_DIRE_ULTIMO AS
-SELECT  t1.PER_RUT,
-        t1.COMUNA,
-        t1.DIRECCION,
-        t1.CALLE,
-        t1.NUMERO     AS NUMERO_DIRE,   /* Renombramos para no chocar con NUMERO de siniestro */
-        t1.TIPO_PROPIEDAD,
-        t1.TIPO        AS TIPO_DIRE      /* Renombramos para no chocar con otras variables */
+CREATE TABLE WORK.PER_DIRE_LAST AS
+SELECT t1.PER_RUT,
+       t1.COMUNA,
+       t1.DIRECCION,
+       t1.CALLE,
+       t1.NUMERO AS NUMERO_DIR, /* Renombramos para evitar conflicto con NUMERO de siniestro */
+       t1.TIPO_PROPIEDAD,
+       t1.NUMERO_PROPIEDAD,
+       t1.RESTO_DIRECCION
 FROM CLSNCPOP.DW_PER_DIRE t1
-INNER JOIN WORK.ENR_DIRE_MAX_FECHA t2
-    ON  t1.PER_RUT = t2.PER_RUT
-    AND t1.FEC_ACT_REGISTRO = t2.MAX_FEC_REGISTRO;
+INNER JOIN WORK.PER_DIRE_MAX t2
+    ON t1.PER_RUT = t2.PER_RUT
+    AND t1.FEC_ACT_REGISTRO = t2.MAX_FEC_REG;
 QUIT;
 
-/* 1c: Deduplicamos por si hay empates en fecha (mismo RUT, misma fecha, distintos registros) */
-PROC SORT DATA=WORK.ENR_DIRE_ULTIMO NODUPKEY;
+/* 1.3 Deduplicamos en caso de empate de fechas (mismo RUT, misma fecha max) */
+PROC SORT DATA=WORK.PER_DIRE_LAST NODUPKEY;
 BY PER_RUT;
 RUN;
 
-/*============================================================================*/
-/*  PASO 2: DW_SEGUROS - Canal de venta, Sucursal, Medio de pago             */
-/*  Fuente: CLSNCPOP.DW_SEGUROS                                              */
-/*  Cruce: RUT_TITULAR = RUT_FINAL                                           */
-/*         + mes(FEC_VIGENCIA) = mes(FEC_OTORGAMIENTO_FINAL)                 */
-/*         + POLIZA_MADRE = POLIZA_FINAL                                     */
-/*                                                                            */
-/*  POR QUE: Si un canal/sucursal/medio de pago concentra los siniestros     */
-/*  anomalos, tenemos un punto de entrada del fraude identificable.           */
-/*  Un canal digital con controles debiles o una sucursal con vendedores      */
-/*  complices explicaria el pico post 08-2024.                                */
-/*                                                                            */
-/*  NOTA TECNICA: Truncamos ambas fechas a inicio de mes porque              */
-/*  FEC_OTORGAMIENTO_FINAL ya viene truncada desde el codigo base via        */
-/*  intnx('month',...,0,'s'). FEC_VIGENCIA es datetime exacta, asi que       */
-/*  le aplicamos datepart() + intnx() para igualar el nivel de agregacion.   */
-/*  Usamos UPCASE() en RUTs por posible mismatch de mayusculas en el DV.     */
-/*============================================================================*/
+/*------------------------------------------------------------------*/
+/* 2. DW_SEGUROS: CANAL, SUCURSAL, MEDIO DE PAGO                    */
+/*------------------------------------------------------------------*/
+/* Por que: Si el fraude entra por un canal o sucursal especifica,
+   la mitigacion operativa es directa (cerrar/auditar ese canal).
+   El medio de pago puede indicar "compra del seguro para siniestrar"
+   (ej: pago unico vs cuotas mensuales).                            */
 
+/* 2.1 Preparamos DW_SEGUROS con las columnas que nos interesan
+   y truncamos FEC_VIGENCIA a mes para el cruce */
 PROC SQL;
-CREATE TABLE WORK.ENR_SEGUROS_INFO AS
-SELECT  t1.NUMERO_FINAL,
-        t2.CANAL_VENTA,
-        t2.SUCURSAL_VENTA,
-        t2.MEDIO_PAGO,
-        t2.FRECUENCIA   AS FRECUENCIA_PAGO,
-        t2.DES_PRODUCTO  AS DES_PRODUCTO_SEG,
-        t2.ESTADO        AS ESTADO_SEGURO,
-        datepart(t2.FEC_VENTA) FORMAT=DDMMYY10. AS FEC_VENTA_SEGURO
-FROM WORK.DW_SINIESTROS_AUX11 t1
-LEFT JOIN CLSNCPOP.DW_SEGUROS t2
-    ON  UPCASE(t1.RUT_FINAL) = UPCASE(t2.RUT_TITULAR)
-    AND intnx('month', t1.FEC_OTORGAMIENTO_FINAL, 0, 's')
-        = intnx('month', datepart(t2.FEC_VIGENCIA), 0, 's')
-    AND t1.POLIZA_FINAL = t2.POLIZA_MADRE;
+CREATE TABLE WORK.SEGUROS_VENTA AS
+SELECT UPCASE(STRIP(t1.RUT_TITULAR)) AS RUT_SEG length=11,
+       STRIP(t1.POLIZA_MADRE) AS POLIZA_SEG,
+       intnx('month', datepart(t1.FEC_VIGENCIA), 0, 's') format=ddmmyy10. AS MES_VIGENCIA,
+       datepart(t1.FEC_VIGENCIA) format=ddmmyy10. AS FEC_VIGENCIA_EXACT,
+       t1.MEDIO_PAGO,
+       t1.CANAL_VENTA,
+       t1.SUCURSAL_VENTA,
+       t1.ESTADO AS ESTADO_SEGURO,
+       t1.DES_PRODUCTO AS DES_PRODUCTO_SEG,
+       t1.FRECUENCIA,
+       t1.PRIMA
+FROM CLSNCPOP.DW_SEGUROS t1
+/* Filtramos solo las polizas de nuestro perimetro para eficiencia */
+WHERE STRIP(t1.POLIZA_MADRE) IN (&FILTRO_BC_AUX);
 QUIT;
 
-/* Proteccion contra duplicados (esperamos 1:1 pero si hay duplicados tomamos 1) */
-PROC SORT DATA=WORK.ENR_SEGUROS_INFO NODUPKEY;
+/* 2.2 Cruzamos por RUT + POLIZA + MES vigencia = MES otorgamiento */
+PROC SQL;
+CREATE TABLE WORK.SEGUROS_MATCH AS
+SELECT t1.*,
+       t2.MEDIO_PAGO,
+       t2.CANAL_VENTA,
+       t2.SUCURSAL_VENTA,
+       t2.ESTADO_SEGURO,
+       t2.DES_PRODUCTO_SEG,
+       t2.FRECUENCIA AS FRECUENCIA_PAGO,
+       t2.PRIMA,
+       t2.FEC_VIGENCIA_EXACT,
+       /* Distancia en dias para dedup: nos quedamos con el mas cercano */
+       ABS(t2.FEC_VIGENCIA_EXACT - t1.FEC_OTORGAMIENTO_FINAL) AS DIST_FECHA
+FROM WORK.BASE_ENRICH t1
+LEFT JOIN WORK.SEGUROS_VENTA t2
+    ON t1.RUT_JOIN = t2.RUT_SEG
+    AND t1.POLIZA_JOIN = t2.POLIZA_SEG
+    AND t1.MES_OTORGAMIENTO = t2.MES_VIGENCIA;
+QUIT;
+
+/* 2.3 Deduplicamos: si hay multiples matches, nos quedamos con el
+   registro cuya fecha de vigencia es mas cercana a la de otorgamiento */
+PROC SORT DATA=WORK.SEGUROS_MATCH;
+BY NUMERO_FINAL DIST_FECHA;
+RUN;
+
+PROC SORT DATA=WORK.SEGUROS_MATCH NODUPKEY;
 BY NUMERO_FINAL;
 RUN;
 
-/*============================================================================*/
-/*  PASO 3a: CANTIDAD DE SEGUROS - Ultimos 12 meses antes de ocurrencia      */
-/*  Fuente: CLSNCPOP.DW_SEGUROS                                              */
-/*                                                                            */
-/*  POR QUE: Si un asegurado contrato multiples seguros en el anio previo    */
-/*  al siniestro, puede indicar "seguro shopping" — contratar para siniestrar.*/
-/*  Esta variable es dinamica por siniestro (cada uno tiene su fecha de       */
-/*  ocurrencia distinta).                                                     */
-/*============================================================================*/
+/*------------------------------------------------------------------*/
+/* 3. CONTEO DE SEGUROS: PERFIL DE CONTRATACION                     */
+/*------------------------------------------------------------------*/
+/* Por que: Alguien que contrata 5 seguros en 12 meses tiene un
+   patron distinto a quien tiene 1. El conteo relativo a la fecha
+   de ocurrencia detecta "buying spree" pre-siniestro. El conteo
+   relativo a dic-2025 da el perfil actual.                          */
 
+/* 3.1 Conteo de TODOS los seguros por RUT en ultimos 12 meses
+   antes de la fecha de ocurrencia del siniestro.
+   NOTA: Contamos todos los productos, no solo los del perimetro,
+   porque queremos capturar el comportamiento global del asegurado. */
 PROC SQL;
-CREATE TABLE WORK.ENR_COUNT_SEG_OCURR AS
-SELECT  t1.NUMERO_FINAL,
-        COUNT(DISTINCT t2.ID_SEGURO) AS N_SEGUROS_12M_PRE_OCURRENCIA
-FROM WORK.DW_SINIESTROS_AUX11 t1
-LEFT JOIN CLSNCPOP.DW_SEGUROS t2
-    ON  UPCASE(t1.RUT_FINAL) = UPCASE(t2.RUT_TITULAR)
-    AND datepart(t2.FEC_VIGENCIA) >= intnx('month', t1.FEC_OCURRENCIA_FINAL, -12, 's')
-    AND datepart(t2.FEC_VIGENCIA) <= t1.FEC_OCURRENCIA_FINAL
-GROUP BY t1.NUMERO_FINAL;
+CREATE TABLE WORK.COUNT_SEG_OCURR AS
+SELECT t2.RUT_JOIN,
+       t2.NUMERO_FINAL,
+       COUNT(*) AS N_SEG_12M_PRE_OCURR
+FROM WORK.BASE_ENRICH t2
+INNER JOIN CLSNCPOP.DW_SEGUROS t1
+    ON UPCASE(STRIP(t1.RUT_TITULAR)) = t2.RUT_JOIN
+WHERE datepart(t1.FEC_VIGENCIA) BETWEEN
+      intnx('day', t2.FEC_OCURRENCIA_FINAL, -365, 's')
+      AND t2.FEC_OCURRENCIA_FINAL
+GROUP BY t2.RUT_JOIN, t2.NUMERO_FINAL;
 QUIT;
 
-/*============================================================================*/
-/*  PASO 3b: CANTIDAD DE SEGUROS - Ultimos 12 meses y vigentes a dic 2025    */
-/*  Fuente: CLSNCPOP.DW_SEGUROS                                              */
-/*                                                                            */
-/*  POR QUE: Esta variable captura la "carga actual" de seguros del RUT.     */
-/*  Un RUT con muchos seguros vigentes tiene mas oportunidades de siniestrar. */
-/*  A diferencia de 3a, esta es fija (no depende de la fecha de ocurrencia), */
-/*  asi que la pre-agregamos por RUT para mayor eficiencia.                   */
-/*============================================================================*/
-
+/* 3.2 Conteo de TODOS los seguros por RUT en ultimos 12 meses
+   antes de la fecha de referencia (dic 2025) */
 PROC SQL;
-CREATE TABLE WORK.ENR_COUNT_SEG_ACTUAL AS
-SELECT  UPCASE(RUT_TITULAR) AS RUT_UPPER,
-        /* Seguros contratados en los ultimos 12 meses respecto a dic 2025 */
-        COUNT(DISTINCT CASE
-            WHEN datepart(FEC_VIGENCIA) >= intnx('month', &Fec_Cierre., -12, 's')
-             AND datepart(FEC_VIGENCIA) <= &Fec_Cierre.
-            THEN ID_SEGURO
-            ELSE ''
-        END) AS N_SEGUROS_12M_DIC2025,
-        /* Seguros actualmente vigentes (independiente de fecha) */
-        SUM(CASE WHEN UPCASE(ESTADO) = 'VIGENTE' THEN 1 ELSE 0 END) AS N_SEGUROS_VIGENTES_TOTAL
-FROM CLSNCPOP.DW_SEGUROS
-GROUP BY UPCASE(RUT_TITULAR);
+CREATE TABLE WORK.COUNT_SEG_REF AS
+SELECT UPCASE(STRIP(t1.RUT_TITULAR)) AS RUT_SEG length=11,
+       COUNT(*) AS N_SEG_12M_DIC2025
+FROM CLSNCPOP.DW_SEGUROS t1
+WHERE datepart(t1.FEC_VIGENCIA) BETWEEN
+      intnx('day', &Fec_Ref., -365, 's')
+      AND &Fec_Ref.
+GROUP BY CALCULATED RUT_SEG;
 QUIT;
 
-/*============================================================================*/
-/*  PASO 4: SINIESTROS EN OTRAS COBERTURAS (cualquier familia de riesgo)     */
-/*  Fuente: CLSNCPOP.DW_SINIESTROS                                           */
-/*                                                                            */
-/*  POR QUE: Si un asegurado siniestra en robo compra protegida Y ADEMAS     */
-/*  tiene siniestros en robo hogar, robo documentos, etc., es un perfil      */
-/*  de riesgo distinto al que solo siniestra una vez en una cobertura.        */
-/*  El modus operandi de un defraudador organizado probablemente se replica  */
-/*  en multiples productos.                                                   */
-/*                                                                            */
-/*  NOTA: Excluimos las polizas de la base actual (FILTRO_BC_AUX) para       */
-/*  capturar solo siniestros en OTRAS coberturas, no los mismos que ya       */
-/*  estan en la base.                                                         */
-/*============================================================================*/
+/* 3.3 Conteo de seguros actualmente VIGENTES por RUT */
+PROC SQL;
+CREATE TABLE WORK.COUNT_SEG_VIG AS
+SELECT UPCASE(STRIP(t1.RUT_TITULAR)) AS RUT_SEG length=11,
+       COUNT(*) AS N_SEG_VIGENTES
+FROM CLSNCPOP.DW_SEGUROS t1
+WHERE UPCASE(STRIP(t1.ESTADO)) = 'VIGENTE'
+GROUP BY CALCULATED RUT_SEG;
+QUIT;
+
+/*------------------------------------------------------------------*/
+/* 4. SINIESTROS EN OTRAS COBERTURAS / POLIZAS                      */
+/*------------------------------------------------------------------*/
+/* Por que: Si un asegurado tiene siniestros en productos fuera del
+   perimetro de fraude (robo hogar, vida, etc.), puede indicar un
+   patron de siniestralidad cruzada - la persona "siniestra todo".
+   Buscamos en DW_SINIESTROS SIN filtro de poliza.                  */
 
 PROC SQL;
-CREATE TABLE WORK.ENR_SIN_OTRAS_COB AS
-SELECT  UPCASE(t1.RUT_ASEGURADO) AS RUT_UPPER,
-        COUNT(DISTINCT t1.NUMERO_SINIESTRO) AS N_SIN_OTRAS_COBERTURAS
+CREATE TABLE WORK.SIN_OTRAS_COB AS
+SELECT UPCASE(STRIP(t1.RUT_ASEGURADO)) AS RUT_SIN length=11,
+       COUNT(DISTINCT t1.NUMERO_SINIESTRO) AS N_SIN_OTRAS_COB,
+       COUNT(DISTINCT t1.POLIZA_MADRE) AS N_POLIZAS_SINIESTRADAS
 FROM CLSNCPOP.DW_SINIESTROS t1
-WHERE t1.POLIZA_MADRE NOT IN (&FILTRO_BC_AUX)
-  AND t1.FEC_OCURRENCIA >= '1Jan2020'd
-GROUP BY UPCASE(t1.RUT_ASEGURADO);
+WHERE t1.FEC_OCURRENCIA >= '1Jan2020'd
+  /* Excluimos las polizas de nuestro perimetro para que solo cuente "otras" */
+  AND STRIP(t1.POLIZA_MADRE) NOT IN (&FILTRO_BC_AUX)
+GROUP BY CALCULATED RUT_SIN;
 QUIT;
 
-/*============================================================================*/
-/*  PASO 5: GIRO / ACTIVIDAD ECONOMICA                                       */
-/*  Fuente: CLSNCPOP.DW_PER_GIRO                                             */
-/*                                                                            */
-/*  POR QUE: Si multiples siniestrados comparten la misma actividad economica */
-/*  en proporcion anomala (ej: todos "sin giro" o todos en el mismo rubro),  */
-/*  puede revelar un patron de red. Tambien es util como feature para el     */
-/*  modelo predictivo.                                                        */
-/*                                                                            */
-/*  NOTA: FECHA_INICIO y FECHA_TERMINO son Char, asi que usamos              */
-/*  FECHA_PROVEEDOR (Date) como proxy para tomar el registro mas reciente.   */
-/*============================================================================*/
+/*------------------------------------------------------------------*/
+/* 5. DW_PER_GIRO: ACTIVIDAD ECONOMICA / GIRO COMERCIAL             */
+/*------------------------------------------------------------------*/
+/* Por que: Queremos explorar si hay concentracion de siniestros en
+   personas con el mismo giro. Un cluster de "comerciantes" o un giro
+   especifico podria indicar un modus operandi compartido.           */
 
-PROC SQL;
-CREATE TABLE WORK.ENR_GIRO_AUX AS
-SELECT  PER_RUT,
-        GLOSA_GIRO,
-        COD_GIRO,
-        FECHA_PROVEEDOR
-FROM CLSNCPOP.DW_PER_GIRO;
-QUIT;
-
-/* Tomamos el registro mas reciente por RUT */
-PROC SORT DATA=WORK.ENR_GIRO_AUX;
+/* Tomamos el ultimo giro registrado por RUT.
+   Usamos PROC SORT + NODUPKEY como alternativa robusta a ROW_NUMBER
+   que funciona en todas las versiones de SAS.                       */
+PROC SORT DATA=CLSNCPOP.DW_PER_GIRO OUT=WORK.PER_GIRO_SORT;
 BY PER_RUT DESCENDING FECHA_PROVEEDOR;
 RUN;
 
-PROC SORT DATA=WORK.ENR_GIRO_AUX NODUPKEY OUT=WORK.ENR_GIRO_ULTIMO;
+PROC SORT DATA=WORK.PER_GIRO_SORT NODUPKEY OUT=WORK.PER_GIRO_LAST (
+    KEEP=PER_RUT COD_GIRO GLOSA_GIRO);
 BY PER_RUT;
 RUN;
 
-/*============================================================================*/
-/*  PASO 6: ENSAMBLE FINAL                                                    */
-/*  Unimos todas las variables nuevas a la base DW_SINIESTROS_AUX11           */
-/*                                                                            */
-/*  NOTA CRITICA SOBRE UPCASE: Todos los cruces por RUT usan UPCASE()        */
-/*  porque detectamos que el digito verificador puede venir en minuscula      */
-/*  en PER_RUT/RUT_TITULAR (ej: '000002497k') pero en mayuscula en           */
-/*  RUT_FINAL (ej: '000002497K'). Sin UPCASE, estos registros no cruzarian. */
-/*============================================================================*/
+/*------------------------------------------------------------------*/
+/* 6. CONSOLIDACION: UNIMOS TODO A LA BASE PRINCIPAL                 */
+/*------------------------------------------------------------------*/
 
 PROC SQL;
 CREATE TABLE WORK.BASE_ENRIQUECIDA AS
-SELECT  t1.*,
+SELECT
+    /* ============================================================ */
+    /* Columnas originales de la base del colega                     */
+    /* ============================================================ */
+    t1.*,
 
-        /* --- Variables de Direccion (DW_PER_DIRE) --- */
-        t2.COMUNA,
-        t2.DIRECCION_COMPLETA,
-        t2.CALLE,
-        t2.NUMERO_DIRE,
-        t2.TIPO_PROPIEDAD,
-        t2.TIPO_DIRE,
+    /* ============================================================ */
+    /* BLOQUE 1: DATOS GEOGRAFICOS (DW_PER_DIRE)                    */
+    /* ============================================================ */
+    t2.COMUNA,
+    t2.DIRECCION AS DIRECCION_COMPLETA,
+    t2.CALLE,
+    t2.NUMERO_DIR,
+    t2.TIPO_PROPIEDAD,
 
-        /* --- Variables de Seguro (DW_SEGUROS) --- */
-        t3.CANAL_VENTA,
-        t3.SUCURSAL_VENTA,
-        t3.MEDIO_PAGO,
-        t3.FRECUENCIA_PAGO,
-        t3.ESTADO_SEGURO,
-        t3.FEC_VENTA_SEGURO,
+    /* ============================================================ */
+    /* BLOQUE 2: DATOS DE VENTA DEL SEGURO (DW_SEGUROS)             */
+    /* Ya vienen en t1 desde SEGUROS_MATCH (paso 2)                 */
+    /* Variables: MEDIO_PAGO, CANAL_VENTA, SUCURSAL_VENTA,          */
+    /*            ESTADO_SEGURO, FRECUENCIA_PAGO, PRIMA             */
+    /* ============================================================ */
 
-        /* --- Conteos de Seguros --- */
-        COALESCE(t4.N_SEGUROS_12M_PRE_OCURRENCIA, 0) AS N_SEGUROS_12M_PRE_OCURRENCIA,
-        COALESCE(t5.N_SEGUROS_12M_DIC2025, 0)        AS N_SEGUROS_12M_DIC2025,
-        COALESCE(t5.N_SEGUROS_VIGENTES_TOTAL, 0)     AS N_SEGUROS_VIGENTES_TOTAL,
+    /* ============================================================ */
+    /* BLOQUE 3: PERFIL DE CONTRATACION DE SEGUROS                  */
+    /* ============================================================ */
+    /* Nro seguros contratados en los 12 meses previos al siniestro */
+    CASE WHEN t3.N_SEG_12M_PRE_OCURR IS NULL THEN 0
+         ELSE t3.N_SEG_12M_PRE_OCURR END AS N_SEG_12M_PRE_OCURR,
 
-        /* --- Siniestros en otras coberturas --- */
-        COALESCE(t6.N_SIN_OTRAS_COBERTURAS, 0)       AS N_SIN_OTRAS_COBERTURAS,
+    /* Nro seguros contratados en los 12 meses previos a dic 2025 */
+    CASE WHEN t4.N_SEG_12M_DIC2025 IS NULL THEN 0
+         ELSE t4.N_SEG_12M_DIC2025 END AS N_SEG_12M_DIC2025,
 
-        /* --- Giro / Actividad Economica --- */
-        t7.GLOSA_GIRO,
-        t7.COD_GIRO
+    /* Nro seguros actualmente vigentes */
+    CASE WHEN t5.N_SEG_VIGENTES IS NULL THEN 0
+         ELSE t5.N_SEG_VIGENTES END AS N_SEG_VIGENTES,
 
-FROM WORK.DW_SINIESTROS_AUX11 t1
+    /* ============================================================ */
+    /* BLOQUE 4: SINIESTRALIDAD CRUZADA                             */
+    /* ============================================================ */
+    /* Nro siniestros en OTRAS coberturas/polizas fuera del perimetro */
+    CASE WHEN t6.N_SIN_OTRAS_COB IS NULL THEN 0
+         ELSE t6.N_SIN_OTRAS_COB END AS N_SIN_OTRAS_COB,
+    CASE WHEN t6.N_POLIZAS_SINIESTRADAS IS NULL THEN 0
+         ELSE t6.N_POLIZAS_SINIESTRADAS END AS N_POLIZAS_SINIESTRADAS,
 
-/* Direccion: ultimo registro */
-LEFT JOIN WORK.ENR_DIRE_ULTIMO t2
-    ON UPCASE(t1.RUT_FINAL) = UPCASE(t2.PER_RUT)
+    /* ============================================================ */
+    /* BLOQUE 5: GIRO COMERCIAL                                     */
+    /* ============================================================ */
+    t7.COD_GIRO,
+    t7.GLOSA_GIRO
 
-/* Canal, sucursal, medio pago del seguro asociado al siniestro */
-LEFT JOIN WORK.ENR_SEGUROS_INFO t3
+FROM WORK.SEGUROS_MATCH t1
+
+/* JOIN 1: Direccion */
+LEFT JOIN WORK.PER_DIRE_LAST t2
+    ON t1.RUT_JOIN = UPCASE(STRIP(t2.PER_RUT))
+
+/* JOIN 2: Conteo seguros pre-ocurrencia */
+LEFT JOIN WORK.COUNT_SEG_OCURR t3
     ON t1.NUMERO_FINAL = t3.NUMERO_FINAL
+    AND t1.RUT_JOIN = t3.RUT_JOIN
 
-/* Cantidad de seguros en 12 meses pre-ocurrencia */
-LEFT JOIN WORK.ENR_COUNT_SEG_OCURR t4
-    ON t1.NUMERO_FINAL = t4.NUMERO_FINAL
+/* JOIN 3: Conteo seguros dic 2025 */
+LEFT JOIN WORK.COUNT_SEG_REF t4
+    ON t1.RUT_JOIN = t4.RUT_SEG
 
-/* Cantidad de seguros 12 meses dic 2025 + vigentes */
-LEFT JOIN WORK.ENR_COUNT_SEG_ACTUAL t5
-    ON UPCASE(t1.RUT_FINAL) = t5.RUT_UPPER
+/* JOIN 4: Conteo seguros vigentes */
+LEFT JOIN WORK.COUNT_SEG_VIG t5
+    ON t1.RUT_JOIN = t5.RUT_SEG
 
-/* Siniestros en otras familias de riesgo */
-LEFT JOIN WORK.ENR_SIN_OTRAS_COB t6
-    ON UPCASE(t1.RUT_FINAL) = t6.RUT_UPPER
+/* JOIN 5: Siniestros en otras coberturas */
+LEFT JOIN WORK.SIN_OTRAS_COB t6
+    ON t1.RUT_JOIN = t6.RUT_SIN
 
-/* Giro / actividad economica */
-LEFT JOIN WORK.ENR_GIRO_ULTIMO t7
-    ON UPCASE(t1.RUT_FINAL) = UPCASE(t7.PER_RUT);
+/* JOIN 6: Giro comercial */
+LEFT JOIN WORK.PER_GIRO_LAST t7
+    ON t1.RUT_JOIN = UPCASE(STRIP(t7.PER_RUT));
 QUIT;
 
-/*============================================================================*/
-/*  PASO 7: VARIABLES DERIVADAS ADICIONALES                                   */
-/*  Calculamos indicadores utiles para el analisis exploratorio y el modelo.  */
-/*============================================================================*/
+/*------------------------------------------------------------------*/
+/* 7. VARIABLES DERIVADAS (calculadas sobre la base consolidada)     */
+/*------------------------------------------------------------------*/
 
 DATA WORK.BASE_ENRIQUECIDA;
 SET WORK.BASE_ENRIQUECIDA;
 
-/* Edad del asegurado al momento de la ocurrencia (en anios) */
+/* ---------------------------------------------------------------- */
+/* 7.1 Edad del asegurado al momento del siniestro                  */
+/* ---------------------------------------------------------------- */
 IF MIN_of_Fec_Nacimiento NE . AND FEC_OCURRENCIA_FINAL NE . THEN
-    EDAD_OCURRENCIA = intck('year', MIN_of_Fec_Nacimiento, FEC_OCURRENCIA_FINAL);
+    EDAD_AL_SINIESTRO = intck('year', MIN_of_Fec_Nacimiento, FEC_OCURRENCIA_FINAL);
 
-/* Dias entre la venta del seguro y el siniestro.
-   Complementa DIF_VIGENCIA (que usa FEC_OTORGAMIENTO truncada a mes).
-   Esta version usa FEC_VENTA exacta de DW_SEGUROS cuando esta disponible,
-   por lo que es mas precisa para detectar siniestros "rapidos". */
-IF FEC_VENTA_SEGURO NE . AND FEC_OCURRENCIA_FINAL NE . THEN
-    DIAS_VENTA_A_SINIESTRO = intck('day', FEC_VENTA_SEGURO, FEC_OCURRENCIA_FINAL);
+/* ---------------------------------------------------------------- */
+/* 7.2 Dia de la semana de la ocurrencia                            */
+/* ---------------------------------------------------------------- */
+/* Patron temporal: si los siniestros se concentran en ciertos dias
+   puede indicar un patron de reporte fabricado */
+IF FEC_OCURRENCIA_FINAL NE . THEN DO;
+    DIA_SEMANA_OCURR = WEEKDAY(FEC_OCURRENCIA_FINAL);
+    /* 1=Domingo, 2=Lunes, ..., 7=Sabado */
+    IF DIA_SEMANA_OCURR IN (1,7) THEN FLAG_FIN_SEMANA = 1;
+    ELSE FLAG_FIN_SEMANA = 0;
+END;
 
-/* Flag: multiples seguros (3+) en el anio previo al siniestro */
-IF N_SEGUROS_12M_PRE_OCURRENCIA >= 3 THEN FLAG_MULTI_SEGUROS = 1;
-ELSE FLAG_MULTI_SEGUROS = 0;
+/* ---------------------------------------------------------------- */
+/* 7.3 Mes y anio de ocurrencia (para series de tiempo en Power BI) */
+/* ---------------------------------------------------------------- */
+IF FEC_OCURRENCIA_FINAL NE . THEN DO;
+    MES_OCURRENCIA = MONTH(FEC_OCURRENCIA_FINAL);
+    ANIO_OCURRENCIA = YEAR(FEC_OCURRENCIA_FINAL);
+    PERIODO_OCURRENCIA = intnx('month', FEC_OCURRENCIA_FINAL, 0, 'b');
+    format PERIODO_OCURRENCIA MONYY7.;
+END;
 
-/* Flag: tiene siniestros en otras coberturas */
-IF N_SIN_OTRAS_COBERTURAS > 0 THEN FLAG_SIN_OTRAS_COB = 1;
-ELSE FLAG_SIN_OTRAS_COB = 0;
+/* ---------------------------------------------------------------- */
+/* 7.4 Tramos de diferencia de vigencia (para analisis de evasion)  */
+/* ---------------------------------------------------------------- */
+/* Complementa SOSPECHA1: queremos ver si los casos post 08-2024
+   caen "justo arriba" del umbral de 31 dias (senal de evasion) */
+IF DIF_VIGENCIA NE . THEN DO;
+    IF DIF_VIGENCIA < 31 THEN TRAMO_DIF_VIG = '1. Menos de 31 dias';
+    ELSE IF DIF_VIGENCIA < 60 THEN TRAMO_DIF_VIG = '2. 31-59 dias';
+    ELSE IF DIF_VIGENCIA < 90 THEN TRAMO_DIF_VIG = '3. 60-89 dias';
+    ELSE IF DIF_VIGENCIA < 180 THEN TRAMO_DIF_VIG = '4. 90-179 dias';
+    ELSE IF DIF_VIGENCIA < 365 THEN TRAMO_DIF_VIG = '5. 180-364 dias';
+    ELSE TRAMO_DIF_VIG = '6. 365+ dias';
+END;
 
-/* Periodo: Pre o Post agosto 2024 (punto de quiebre identificado en el analisis previo) */
-IF FEC_OCURRENCIA_FINAL >= '1Aug2024'd THEN PERIODO_QUIEBRE = 'POST_AGO2024';
-ELSE PERIODO_QUIEBRE = 'PRE_AGO2024';
+/* ---------------------------------------------------------------- */
+/* 7.5 Tramos de uso de tope (para analisis de evasion)             */
+/* ---------------------------------------------------------------- */
+/* Complementa SOSPECHA4: queremos ver si reclaman "justo debajo"
+   del 80% (senal de que conocen el umbral y lo evaden) */
+IF USO_TOPE NE . THEN DO;
+    IF USO_TOPE < 0.5 THEN TRAMO_USO_TOPE = '1. Menos de 50%';
+    ELSE IF USO_TOPE < 0.7 THEN TRAMO_USO_TOPE = '2. 50-69%';
+    ELSE IF USO_TOPE < 0.8 THEN TRAMO_USO_TOPE = '3. 70-79%';
+    ELSE IF USO_TOPE < 0.9 THEN TRAMO_USO_TOPE = '4. 80-89%';
+    ELSE IF USO_TOPE < 1.0 THEN TRAMO_USO_TOPE = '5. 90-99%';
+    ELSE TRAMO_USO_TOPE = '6. 100%+';
+END;
 
-/* Estandarizacion de COMUNA a mayusculas sin espacios extra
-   (necesario para la clusterizacion geografica en Power BI / Python) */
-COMUNA_STD = UPCASE(STRIP(COMUNA));
+/* ---------------------------------------------------------------- */
+/* 7.6 Flag de periodo post agosto 2024 (el quiebre)                */
+/* ---------------------------------------------------------------- */
+IF FEC_OCURRENCIA_FINAL NE . THEN DO;
+    IF FEC_OCURRENCIA_FINAL >= '1Aug2024'd THEN FLAG_POST_AGO2024 = 1;
+    ELSE FLAG_POST_AGO2024 = 0;
+END;
+
+/* ---------------------------------------------------------------- */
+/* 7.7 Tramo de edad                                                */
+/* ---------------------------------------------------------------- */
+IF EDAD_AL_SINIESTRO NE . THEN DO;
+    IF EDAD_AL_SINIESTRO < 25 THEN TRAMO_EDAD = '1. <25';
+    ELSE IF EDAD_AL_SINIESTRO < 35 THEN TRAMO_EDAD = '2. 25-34';
+    ELSE IF EDAD_AL_SINIESTRO < 45 THEN TRAMO_EDAD = '3. 35-44';
+    ELSE IF EDAD_AL_SINIESTRO < 55 THEN TRAMO_EDAD = '4. 45-54';
+    ELSE IF EDAD_AL_SINIESTRO < 65 THEN TRAMO_EDAD = '5. 55-64';
+    ELSE TRAMO_EDAD = '6. 65+';
+END;
+
+/* ---------------------------------------------------------------- */
+/* 7.8 Flags de perfil (para modelo predictivo y Power BI)          */
+/* ---------------------------------------------------------------- */
+
+/* Multi-seguro: 3+ seguros contratados en 12 meses pre-siniestro */
+IF N_SEG_12M_PRE_OCURR >= 3 THEN FLAG_MULTI_SEGURO = 1;
+ELSE FLAG_MULTI_SEGURO = 0;
+
+/* Siniestralidad cruzada: tiene siniestros en otros productos */
+IF N_SIN_OTRAS_COB > 0 THEN FLAG_SIN_CRUZADA = 1;
+ELSE FLAG_SIN_CRUZADA = 0;
 
 RUN;
 
-/*============================================================================*/
-/*  PASO 8: EXPORTAR                                                          */
-/*============================================================================*/
+/*------------------------------------------------------------------*/
+/* 8. DIAGNOSTICO DE CALIDAD DE CRUCES                               */
+/*------------------------------------------------------------------*/
+/* IMPORTANTE: Ejecutar esto primero para validar que los cruces
+   funcionaron correctamente antes de seguir con el analisis.
+   Si hay muchos missings en alguna variable, el cruce fallo.        */
 
-/* Guardar en libreria permanente */
+TITLE "=== DIAGNOSTICO: Tasa de match por variable de enriquecimiento ===";
+PROC SQL;
+SELECT
+    COUNT(*) AS TOTAL_REGISTROS,
+
+    /* Cruces geograficos */
+    SUM(CASE WHEN COMUNA NE '' THEN 1 ELSE 0 END) AS N_CON_COMUNA,
+    CALCULATED N_CON_COMUNA / CALCULATED TOTAL_REGISTROS * 100
+        format=5.1 AS PCT_COMUNA,
+
+    /* Cruces de venta */
+    SUM(CASE WHEN CANAL_VENTA NE '' THEN 1 ELSE 0 END) AS N_CON_CANAL,
+    CALCULATED N_CON_CANAL / CALCULATED TOTAL_REGISTROS * 100
+        format=5.1 AS PCT_CANAL,
+
+    SUM(CASE WHEN SUCURSAL_VENTA NE '' THEN 1 ELSE 0 END) AS N_CON_SUCURSAL,
+    CALCULATED N_CON_SUCURSAL / CALCULATED TOTAL_REGISTROS * 100
+        format=5.1 AS PCT_SUCURSAL,
+
+    SUM(CASE WHEN MEDIO_PAGO NE '' THEN 1 ELSE 0 END) AS N_CON_MEDIO_PAGO,
+    CALCULATED N_CON_MEDIO_PAGO / CALCULATED TOTAL_REGISTROS * 100
+        format=5.1 AS PCT_MEDIO_PAGO,
+
+    /* Giro */
+    SUM(CASE WHEN GLOSA_GIRO NE '' THEN 1 ELSE 0 END) AS N_CON_GIRO,
+    CALCULATED N_CON_GIRO / CALCULATED TOTAL_REGISTROS * 100
+        format=5.1 AS PCT_GIRO,
+
+    /* Conteos (deberian tener registros > 0 para la mayoria) */
+    SUM(CASE WHEN N_SEG_12M_PRE_OCURR > 0 THEN 1 ELSE 0 END) AS N_CON_SEGUROS_PRE,
+    CALCULATED N_CON_SEGUROS_PRE / CALCULATED TOTAL_REGISTROS * 100
+        format=5.1 AS PCT_SEGUROS_PRE
+
+FROM WORK.BASE_ENRIQUECIDA;
+QUIT;
+TITLE;
+
+/* ---------------------------------------------------------------- */
+/* Distribucion de nuevas variables para inspeccion rapida           */
+/* ---------------------------------------------------------------- */
+
+TITLE "TOP 20 COMUNAS POR SINIESTROS";
+PROC SQL OUTOBS=20;
+SELECT COMUNA,
+       COUNT(*) AS N_SINIESTROS,
+       SUM(CASE WHEN SOSPECHA_FINAL >= 2 THEN 1 ELSE 0 END) AS N_SOSPECHOSOS,
+       CALCULATED N_SOSPECHOSOS / CALCULATED N_SINIESTROS * 100
+           format=5.1 AS PCT_SOSPECHOSOS,
+       SUM(CASE WHEN FLAG_POST_AGO2024 = 1 THEN 1 ELSE 0 END) AS N_POST_AGO2024
+FROM WORK.BASE_ENRIQUECIDA
+WHERE COMUNA NE ''
+GROUP BY COMUNA
+ORDER BY N_SINIESTROS DESC;
+QUIT;
+TITLE;
+
+TITLE "DISTRIBUCION POR CANAL DE VENTA";
+PROC SQL;
+SELECT CANAL_VENTA,
+       COUNT(*) AS N_SINIESTROS,
+       SUM(CASE WHEN SOSPECHA_FINAL >= 2 THEN 1 ELSE 0 END) AS N_SOSPECHOSOS,
+       SUM(CASE WHEN FLAG_POST_AGO2024 = 1 THEN 1 ELSE 0 END) AS N_POST_AGO2024,
+       CALCULATED N_SOSPECHOSOS / CALCULATED N_SINIESTROS * 100
+           format=5.1 AS PCT_SOSPECHOSOS
+FROM WORK.BASE_ENRIQUECIDA
+WHERE CANAL_VENTA NE ''
+GROUP BY CANAL_VENTA
+ORDER BY N_SINIESTROS DESC;
+QUIT;
+TITLE;
+
+TITLE "TOP 20 SUCURSALES POR SINIESTROS";
+PROC SQL OUTOBS=20;
+SELECT SUCURSAL_VENTA,
+       COUNT(*) AS N_SINIESTROS,
+       SUM(CASE WHEN SOSPECHA_FINAL >= 2 THEN 1 ELSE 0 END) AS N_SOSPECHOSOS,
+       SUM(CASE WHEN FLAG_POST_AGO2024 = 1 THEN 1 ELSE 0 END) AS N_POST_AGO2024,
+       CALCULATED N_SOSPECHOSOS / CALCULATED N_SINIESTROS * 100
+           format=5.1 AS PCT_SOSPECHOSOS
+FROM WORK.BASE_ENRIQUECIDA
+WHERE SUCURSAL_VENTA NE ''
+GROUP BY SUCURSAL_VENTA
+ORDER BY N_SINIESTROS DESC;
+QUIT;
+TITLE;
+
+TITLE "DISTRIBUCION POR MEDIO DE PAGO";
+PROC SQL;
+SELECT MEDIO_PAGO,
+       COUNT(*) AS N_SINIESTROS,
+       SUM(CASE WHEN SOSPECHA_FINAL >= 2 THEN 1 ELSE 0 END) AS N_SOSPECHOSOS,
+       CALCULATED N_SOSPECHOSOS / CALCULATED N_SINIESTROS * 100
+           format=5.1 AS PCT_SOSPECHOSOS
+FROM WORK.BASE_ENRIQUECIDA
+WHERE MEDIO_PAGO NE ''
+GROUP BY MEDIO_PAGO
+ORDER BY N_SINIESTROS DESC;
+QUIT;
+TITLE;
+
+TITLE "ANALISIS DE EVASION: TRAMO DIF VIGENCIA POR PERIODO";
+PROC SQL;
+SELECT TRAMO_DIF_VIG,
+       SUM(CASE WHEN FLAG_POST_AGO2024 = 0 THEN 1 ELSE 0 END) AS N_PRE_AGO2024,
+       SUM(CASE WHEN FLAG_POST_AGO2024 = 1 THEN 1 ELSE 0 END) AS N_POST_AGO2024
+FROM WORK.BASE_ENRIQUECIDA
+WHERE TRAMO_DIF_VIG NE ''
+GROUP BY TRAMO_DIF_VIG
+ORDER BY TRAMO_DIF_VIG;
+QUIT;
+TITLE;
+
+TITLE "ANALISIS DE EVASION: TRAMO USO TOPE POR PERIODO";
+PROC SQL;
+SELECT TRAMO_USO_TOPE,
+       SUM(CASE WHEN FLAG_POST_AGO2024 = 0 THEN 1 ELSE 0 END) AS N_PRE_AGO2024,
+       SUM(CASE WHEN FLAG_POST_AGO2024 = 1 THEN 1 ELSE 0 END) AS N_POST_AGO2024
+FROM WORK.BASE_ENRIQUECIDA
+WHERE TRAMO_USO_TOPE NE ''
+GROUP BY TRAMO_USO_TOPE
+ORDER BY TRAMO_USO_TOPE;
+QUIT;
+TITLE;
+
+TITLE "DISTRIBUCION POR GLOSA GIRO (Top 15)";
+PROC SQL OUTOBS=15;
+SELECT GLOSA_GIRO,
+       COUNT(*) AS N_SINIESTROS,
+       SUM(CASE WHEN SOSPECHA_FINAL >= 2 THEN 1 ELSE 0 END) AS N_SOSPECHOSOS,
+       CALCULATED N_SOSPECHOSOS / CALCULATED N_SINIESTROS * 100
+           format=5.1 AS PCT_SOSPECHOSOS
+FROM WORK.BASE_ENRIQUECIDA
+WHERE GLOSA_GIRO NE ''
+GROUP BY GLOSA_GIRO
+ORDER BY N_SINIESTROS DESC;
+QUIT;
+TITLE;
+
+/*------------------------------------------------------------------*/
+/* 9. EXPORTACION                                                    */
+/*------------------------------------------------------------------*/
+
+/* Guardamos en libreria permanente */
 DATA SALIDAS.ROBO_ENRIQUECIDA;
 SET WORK.BASE_ENRIQUECIDA;
 RUN;
 
-/* Exportar a Excel para Power BI */
-proc export
-    data=WORK.BASE_ENRIQUECIDA
-    dbms=XLSX
-    outfile="/sasdata/Proyectos/Estudios/ROBO_ENRIQUECIDA"
-    replace;
+/* Exportamos a Excel para Power BI */
+PROC EXPORT
+    DATA=WORK.BASE_ENRIQUECIDA
+    DBMS=XLSX
+    OUTFILE="/sasdata/Proyectos/Estudios/ROBO_ENRIQUECIDA"
+    REPLACE;
     SHEET="BASE_ENRIQUECIDA";
-run;
+RUN;
 
-/*============================================================================*/
-/*  PASO 9: VALIDACIONES                                                      */
-/*  Ejecutar estos queries para verificar que los cruces funcionaron bien.    */
-/*  NO es necesario para el output, pero SI para asegurar calidad de datos.  */
-/*============================================================================*/
-
-TITLE "9a: TASA DE MATCH POR VARIABLE - Si alguna es menor a ~70%, revisar cruce";
-PROC SQL;
-    SELECT  COUNT(*) AS TOTAL_REGISTROS,
-
-            /* Direccion */
-            SUM(CASE WHEN COMUNA NE '' THEN 1 ELSE 0 END) AS CON_COMUNA,
-            CALCULATED CON_COMUNA / CALCULATED TOTAL_REGISTROS * 100
-                FORMAT=8.1 AS PCT_COMUNA,
-
-            /* Canal de venta */
-            SUM(CASE WHEN CANAL_VENTA NE '' THEN 1 ELSE 0 END) AS CON_CANAL,
-            CALCULATED CON_CANAL / CALCULATED TOTAL_REGISTROS * 100
-                FORMAT=8.1 AS PCT_CANAL,
-
-            /* Sucursal */
-            SUM(CASE WHEN SUCURSAL_VENTA NE '' THEN 1 ELSE 0 END) AS CON_SUCURSAL,
-            CALCULATED CON_SUCURSAL / CALCULATED TOTAL_REGISTROS * 100
-                FORMAT=8.1 AS PCT_SUCURSAL,
-
-            /* Medio de pago */
-            SUM(CASE WHEN MEDIO_PAGO NE '' THEN 1 ELSE 0 END) AS CON_MEDIO_PAGO,
-            CALCULATED CON_MEDIO_PAGO / CALCULATED TOTAL_REGISTROS * 100
-                FORMAT=8.1 AS PCT_MEDIO_PAGO,
-
-            /* Giro */
-            SUM(CASE WHEN GLOSA_GIRO NE '' THEN 1 ELSE 0 END) AS CON_GIRO,
-            CALCULATED CON_GIRO / CALCULATED TOTAL_REGISTROS * 100
-                FORMAT=8.1 AS PCT_GIRO
-
-    FROM WORK.BASE_ENRIQUECIDA;
+/*------------------------------------------------------------------*/
+/* 10. LIMPIEZA DE TABLAS INTERMEDIAS                                */
+/*------------------------------------------------------------------*/
+PROC DATASETS LIBRARY=WORK NOLIST;
+    DELETE BASE_ENRICH PER_DIRE_MAX PER_DIRE_LAST
+           SEGUROS_VENTA SEGUROS_MATCH
+           COUNT_SEG_OCURR COUNT_SEG_REF COUNT_SEG_VIG
+           SIN_OTRAS_COB PER_GIRO_SORT PER_GIRO_LAST;
+RUN;
 QUIT;
-
-TITLE "9b: CONTROL DE DUPLICADOS - Ambos conteos deben ser iguales";
-PROC SQL;
-    SELECT  COUNT(*) AS TOTAL_BASE_ORIGINAL
-    FROM WORK.DW_SINIESTROS_AUX11;
-
-    SELECT  COUNT(*) AS TOTAL_BASE_ENRIQUECIDA
-    FROM WORK.BASE_ENRIQUECIDA;
-QUIT;
-/* Si TOTAL_BASE_ENRIQUECIDA > TOTAL_BASE_ORIGINAL, hay duplicados por el cruce con DW_SEGUROS */
-
-TITLE "9c: DISTRIBUCION N_SEGUROS_12M_PRE_OCURRENCIA";
-PROC SQL;
-    SELECT  N_SEGUROS_12M_PRE_OCURRENCIA,
-            COUNT(*) AS FREQ
-    FROM WORK.BASE_ENRIQUECIDA
-    GROUP BY N_SEGUROS_12M_PRE_OCURRENCIA
-    ORDER BY N_SEGUROS_12M_PRE_OCURRENCIA;
-QUIT;
-
-TITLE "9d: DISTRIBUCION N_SIN_OTRAS_COBERTURAS";
-PROC SQL;
-    SELECT  N_SIN_OTRAS_COBERTURAS,
-            COUNT(*) AS FREQ
-    FROM WORK.BASE_ENRIQUECIDA
-    GROUP BY N_SIN_OTRAS_COBERTURAS
-    ORDER BY N_SIN_OTRAS_COBERTURAS;
-QUIT;
-
-TITLE "9e: TOP 20 COMUNAS POR FRECUENCIA DE SINIESTROS";
-PROC SQL OUTOBS=20;
-    SELECT  COMUNA_STD,
-            COUNT(*) AS FREQ
-    FROM WORK.BASE_ENRIQUECIDA
-    WHERE COMUNA_STD NE ''
-    GROUP BY COMUNA_STD
-    ORDER BY FREQ DESC;
-QUIT;
-
-TITLE "9f: COMPARACION PRE vs POST QUIEBRE AGO-2024";
-PROC SQL;
-    SELECT  PERIODO_QUIEBRE,
-            COUNT(*) AS N_SINIESTROS,
-            AVG(N_SEGUROS_12M_PRE_OCURRENCIA) FORMAT=8.2 AS PROM_SEG_12M,
-            AVG(N_SIN_OTRAS_COBERTURAS) FORMAT=8.2 AS PROM_SIN_OTRAS_COB,
-            AVG(DIF_VIGENCIA) FORMAT=8.1 AS PROM_DIF_VIGENCIA,
-            AVG(USO_TOPE) FORMAT=8.3 AS PROM_USO_TOPE,
-            AVG(SOSPECHA_FINAL) FORMAT=8.2 AS PROM_SOSPECHA_FINAL
-    FROM WORK.BASE_ENRIQUECIDA
-    GROUP BY PERIODO_QUIEBRE;
-QUIT;
-
-TITLE "9g: DISTRIBUCION CANAL_VENTA POR PERIODO";
-PROC SQL;
-    SELECT  PERIODO_QUIEBRE,
-            CANAL_VENTA,
-            COUNT(*) AS FREQ
-    FROM WORK.BASE_ENRIQUECIDA
-    WHERE CANAL_VENTA NE ''
-    GROUP BY PERIODO_QUIEBRE, CANAL_VENTA
-    ORDER BY PERIODO_QUIEBRE, FREQ DESC;
-QUIT;
-
-TITLE "9h: DISTRIBUCION MEDIO_PAGO POR PERIODO";
-PROC SQL;
-    SELECT  PERIODO_QUIEBRE,
-            MEDIO_PAGO,
-            COUNT(*) AS FREQ
-    FROM WORK.BASE_ENRIQUECIDA
-    WHERE MEDIO_PAGO NE ''
-    GROUP BY PERIODO_QUIEBRE, MEDIO_PAGO
-    ORDER BY PERIODO_QUIEBRE, FREQ DESC;
-QUIT;
-
-TITLE;
-
-/*============================================================================*/
-/*  LIMPIEZA DE TABLAS TEMPORALES DEL ENRIQUECIMIENTO                        */
-/*============================================================================*/
-
-proc datasets library=work nolist;
-    delete ENR_DIRE_MAX_FECHA ENR_DIRE_ULTIMO
-           ENR_SEGUROS_INFO
-           ENR_COUNT_SEG_OCURR ENR_COUNT_SEG_ACTUAL
-           ENR_SIN_OTRAS_COB
-           ENR_GIRO_AUX ENR_GIRO_ULTIMO;
-run;
-quit;
