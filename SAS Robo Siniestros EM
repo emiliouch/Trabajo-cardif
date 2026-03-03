@@ -1,3 +1,15 @@
+PROC SQL;
+    CREATE TABLE WORK.FILTRO_BC AS
+    SELECT DISTINCT T1.POLIZA
+    FROM WORK.Base_Correspondencia T1
+    WHERE UPPER(t1.'Familia de Riesgo'n) = 'FRAUDE';
+QUIT;
+
+PROC SQL NOPRINT;
+    SELECT QUOTE(TRIM(T1.POLIZA), "'") INTO :FILTRO_BC_AUX SEPARATED BY ','
+    FROM WORK.FILTRO_BC T1;
+QUIT;
+
 /*====================================================================*/
 /*  MODULO DE ENRIQUECIMIENTO - ANALISIS FRAUDE ROBO                  */
 /*  Input:  SALIDAS.ROBO_ENERO2025 (output del codigo del colega)     */
