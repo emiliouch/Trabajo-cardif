@@ -1,5 +1,5 @@
 /*=============================================================================*
-* MODULO ENRIQUECIMIENTO + VARIABLES ANALITICAS
+* MODULO ENRIQUECIMIENTO + VARIABLES ANALITICAS (Doc1 actualizado con Doc2)
 *
 * Input  : SALIDAS.ROBO_ENERO2025  (output del pipeline de siniestros)
 * Output : SALIDAS.ROBO_ENRIQUECIDA (tabla) + Excel en /sasdata/Proyectos/Estudios
@@ -521,3 +521,17 @@ proc export
   replace;
   sheet="BASE_ENRIQUECIDA";
 run;
+
+/*=============================================================================*
+* 11) LIMPIEZA
+*=============================================================================*/
+proc datasets library=work nolist;
+  delete filtro_bc per_dire_prep per_dire_prep2 per_dire_last
+         per_giro_prep per_giro_prep2 per_giro_last
+         seguros_perim seguros_perim2
+         seguros_all_small seguros_all_small2
+         count_seg_ocurr count_seg_ref count_seg_vig
+         dw_siniestros_small dw_siniestros_small2 sin_otras_cob
+         base_enrich ruts_base
+         base_seguros_match;
+quit;
