@@ -1,0 +1,104 @@
+/*==============================================================*
+* 4) DW_SEGUROS perimetro: version RAPIDA (sin JOIN grande)
+*    - Filtra por:
+*      (a) RUT en universo (HASH)
+*      (b) POLIZA en perimetro (HASH)
+*      (c) Rango de FEC_VIGENCIA (datetime) basado en base_enrich
+*==============================================================*/
+
+/* 4.0) Bounds datetime para recortar DW_SEGUROS por vigencia */
+proc sql noprint;
+  create table work._bounds as
+  select min(MES_OTORGAMIENTO) as min_mes format=ddmmyy10.,
+         max(MES_OTORGAMIENTO) as max_mes format=ddmmyy10.
+  from work.base_enrich;
+quit;
+
+data _null_;
+  set work._bounds;
+  /* desde inicio del min_mes */
+  dt_min = dhms(min_mes, 0, 0, 0);
+  /* hasta inicio del mes siguiente al max_mes (semi-abierto) */
+  dt_max = dhms(intnx('month', max_mes, 1, 'b'), 0, 0, 0);
+  call symputx('DT_MIN', dt_min);
+  call symputx('DT_MAX', dt_max);
+run;
+
+proc datasets library=work nolist;
+  delete _bounds;
+quit;
+
+/* 4.1) Crear work.seguros_perim (filtrado por HASHs + rango datetime) */
+data work.seguros_perim;
+  length RUT_JOIN $10 POLIZA_JOIN $50;
+  format MES_VIGENCIA ddmmyy10. FEC_VIG_EXACT ddmmyy10.;
+
+  if _n_=1 then do;
+    /* HASH de RUT (universo) */
+    declare hash hR(dataset:'work.ruts_base');
+    hR.defineKey('RUT_JOIN');
+    hR.defineDone();
+
+    /* HASH de pólizas perimetro */
+    declare hash hP(dataset:'work.polizas_perim');
+    hP.defineKey('POLIZA_JOIN');
+    hP.defineDone();
+  end;
+
+  set clsncpop.dw_seguros(
+    keep=RUT_TITULAR POLIZA_MADRE FEC_VIGENCIA
+         MEDIO_PAGO CANAL_VENTA SUCURSAL_VENTA ESTADO
+         DES_PRODUCTO FRECUENCIA PRIMA ID_SEGURO
+    where=(FEC_VIGENCIA >= &DT_MIN and FEC_VIGENCIA < &DT_MAX)
+  );
+
+  /* llaves */
+  RUT_JOIN    = upcase(strip(RUT_TITULAR));
+  POLIZA_JOIN = strip(POLIZA_MADRE);
+
+  /* filtro por universo */
+  if hR.find() ne 0 then delete;
+
+  /* filtro por perimetro poliza */
+  if hP.find() ne 0 then delete;
+
+  /* campos de match */
+  FEC_VIG_EXACT = datepart(FEC_VIGENCIA);
+  MES_VIGENCIA  = intnx('month', FEC_VIG_EXACT, 0, 'b');
+
+  output;
+
+  keep RUT_JOIN POLIZA_JOIN MES_VIGENCIA FEC_VIG_EXACT
+       MEDIO_PAGO CANAL_VENTA SUCURSAL_VENTA ESTADO
+       DES_PRODUCTO FRECUENCIA PRIMA ID_SEGURO;
+run;
+
+/* 4.2) MATCH base_enrich + seguros_perim por RUT+POLIZA+MES + dedup por cercanía */
+proc sql;
+  create table work.base_seguros_match as
+  select b.*,
+         s.MEDIO_PAGO     as MEDIO_PAGO_SEG length=100,
+         s.CANAL_VENTA    as CANAL_VENTA_SEG length=4000,
+         s.SUCURSAL_VENTA as SUCURSAL_VENTA_SEG length=100,
+         s.ESTADO         as ESTADO_SEGURO length=50,
+         s.DES_PRODUCTO   as DES_PRODUCTO_SEG length=255,
+         s.FRECUENCIA     as FRECUENCIA_PAGO length=100,
+         s.PRIMA          as PRIMA_SEG,
+         s.ID_SEGURO      as ID_SEGURO_SEG length=50,
+         s.FEC_VIG_EXACT  as FEC_VIGENCIA_EXACT format=ddmmyy10.,
+         abs(s.FEC_VIG_EXACT - b.FEC_OTORGAMIENTO_FINAL) as DIST_FECHA
+  from work.base_enrich b
+  left join work.seguros_perim s
+    on b.RUT_JOIN        = s.RUT_JOIN
+   and b.POLIZA_JOIN     = s.POLIZA_JOIN
+   and b.MES_OTORGAMIENTO= s.MES_VIGENCIA
+  ;
+quit;
+
+proc sort data=work.base_seguros_match;
+  by KEY_CLAIM DIST_FECHA;
+run;
+
+proc sort data=work.base_seguros_match nodupkey;
+  by KEY_CLAIM;
+run;
