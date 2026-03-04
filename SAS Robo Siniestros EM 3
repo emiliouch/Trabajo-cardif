@@ -1,0 +1,681 @@
+/*=============================================================================*
+* MODULO ENRIQUECIMIENTO + VARIABLES ANALITICAS (OPTIMIZADO PARA 10M+ FILAS)
+*
+* Input  : SALIDAS.ROBO_ENERO2025
+* Output : SALIDAS.ROBO_ENRIQUECIDA + Excel
+*
+* Enfoque performance:
+* - Evitar FCMP/PRX “normalizador” masivo: RUTs ya vienen canónicos -> UPCASE+STRIP.
+* - Filtrar tablas gigantes por universo de RUT usando HASH.
+* - Filtrar perimetro de polizas con JOIN a tabla chica (work.polizas_perim).
+* - Conteos “últimos 12M” calculados por MES (agregación previa) para reducir joins rango.
+*=============================================================================*/
+
+/*-----------------------------*
+* 0) PARAMETROS
+*-----------------------------*/
+%let Fec_Inicio = '01jan2022'd;
+%let Fec_Cierre = '31dec2025'd;
+%let Fec_Ref    = '31dec2025'd;
+
+libname Salidas "/sasdata/Proyectos";
+
+/*-----------------------------*
+* 0.1) Asegurar &FILTRO_BC_AUX y tabla de polizas perimetro
+*-----------------------------*/
+%macro ensure_polizas_perim;
+  %if not %symexist(FILTRO_BC_AUX) %then %do;
+    proc sql;
+      create table work.filtro_bc as
+      select distinct put(Poliza, best12.) as POLIZA_CHAR length=15
+      from work.base_correspondencia
+      where upcase(strip('Familia de Riesgo'n)) = 'FRAUDE';
+    quit;
+
+    proc sql noprint;
+      select quote(trim(POLIZA_CHAR), "'") into :FILTRO_BC_AUX separated by ','
+      from work.filtro_bc;
+    quit;
+  %end;
+
+  /* tabla chica con polizas para joins (más eficiente que IN largo) */
+  proc sql;
+    create table work.polizas_perim as
+    select distinct strip(p) as POLIZA_JOIN length=50
+    from (
+      select distinct compress(tranwrd(tranwrd(tranwrd(POLIZA_CHAR,"'","")," ",""),'"','')) as p
+      from %sysfunc(ifc(%sysfunc(exist(work.filtro_bc)), work.filtro_bc, work.filtro_bc))
+    );
+  quit;
+
+  /* Si work.filtro_bc no existe (porque venía del pipeline y no se creó aquí),
+     construimos polizas_perim directamente desde &FILTRO_BC_AUX */
+  %if not %sysfunc(exist(work.polizas_perim)) %then %do;
+    data work.polizas_perim;
+      length POLIZA_JOIN $50;
+      do _i_=1 by 1 while(scan("&FILTRO_BC_AUX", _i_, ',') ne '');
+        POLIZA_JOIN = compress(scan("&FILTRO_BC_AUX", _i_, ','), "'");
+        output;
+      end;
+      drop _i_;
+    run;
+  %end;
+
+  proc sort data=work.polizas_perim nodupkey;
+    by POLIZA_JOIN;
+  run;
+%mend;
+%ensure_polizas_perim;
+
+/*=============================================================================*
+* 1) INPUT BASE: cargar y preparar llaves (RUT_JOIN “liviano”)
+*=============================================================================*/
+data work.base_enrich;
+  set Salidas.ROBO_ENERO2025;
+
+  /* filtro periodo */
+  if &Fec_Inicio <= FEC_OCURRENCIA_FINAL <= &Fec_Cierre;
+
+  length RUT_JOIN $10 POLIZA_JOIN $50 NUMERO_FINAL_C $32 KEY_CLAIM $40;
+
+  /* RUT ya viene canónico (según ejemplos): solo UPCASE+STRIP */
+  RUT_JOIN = upcase(strip(RUT_FINAL));
+
+  /* Si por alguna razón viniera con guion/puntos (poco probable en esta base),
+     limpiamos SOLO cuando detectamos caracteres típicos (barato en base chica) */
+  if indexc(RUT_JOIN,'-. ') > 0 then RUT_JOIN = compress(RUT_JOIN, , 'kad');
+
+  /* POLIZA */
+  if vtype(POLIZA_FINAL)='N' then POLIZA_JOIN = strip(put(POLIZA_FINAL, best16.));
+  else POLIZA_JOIN = strip(POLIZA_FINAL);
+
+  /* NUMERO_FINAL a char y key robusta */
+  if vtype(NUMERO_FINAL)='N' then NUMERO_FINAL_C = strip(put(NUMERO_FINAL, best16.));
+  else NUMERO_FINAL_C = strip(NUMERO_FINAL);
+
+  if not missing(ID) then KEY_CLAIM = cats('ID=', strip(put(ID, best16.)));
+  else if not missing(NUMERO_FINAL_C) then KEY_CLAIM = cats('N=', NUMERO_FINAL_C);
+  else KEY_CLAIM = cats('ROW=', put(_n_, best16.));
+
+  /* mes otorgamiento y mes ocurrencia */
+  MES_OTORGAMIENTO = intnx('month', FEC_OTORGAMIENTO_FINAL, 0, 'b');
+  MES_OCURRENCIA   = intnx('month', FEC_OCURRENCIA_FINAL,   0, 'b');
+  format MES_OTORGAMIENTO MES_OCURRENCIA ddmmyy10.;
+
+  /* flags evasión “raw” */
+  FLAG_EVASION_DIF31_45   = (31 <= DIF_VIGENCIA <= 45);
+  FLAG_EVASION_TOPE_75_80 = (0.75 <= USO_TOPE < 0.8);
+
+run;
+
+/* universo de RUT */
+proc sql;
+  create table work.ruts_base as
+  select distinct RUT_JOIN
+  from work.base_enrich
+  where RUT_JOIN ne '' and length(strip(RUT_JOIN))=10;
+quit;
+
+/*=============================================================================*
+* 2) DW_PER_DIRE: último registro por RUT (filtrado por HASH a ruts_base)
+*=============================================================================*/
+data work.per_dire_filt;
+  length RUT_JOIN $10;
+  if _n_=1 then do;
+    declare hash h(dataset:'work.ruts_base');
+    h.defineKey('RUT_JOIN');
+    h.defineDone();
+  end;
+
+  set clsncpop.dw_per_dire(
+    keep=PER_RUT COMUNA DIRECCION CALLE NUMERO TIPO_PROPIEDAD NUMERO_PROPIEDAD RESTO_DIRECCION FEC_ACT_REGISTRO ID
+  );
+
+  RUT_JOIN = upcase(strip(PER_RUT));
+  if h.find()=0 then output;
+run;
+
+proc sort data=work.per_dire_filt;
+  by RUT_JOIN descending FEC_ACT_REGISTRO descending ID;
+run;
+
+data work.per_dire_last;
+  set work.per_dire_filt;
+  by RUT_JOIN;
+  if first.RUT_JOIN;
+
+  rename
+    COMUNA          = COMUNA_PER
+    DIRECCION       = DIRECCION_PER
+    CALLE           = CALLE_PER
+    NUMERO          = NUMERO_DIR
+    TIPO_PROPIEDAD  = TIPO_PROPIEDAD_PER
+    NUMERO_PROPIEDAD= NUMERO_PROPIEDAD_PER
+    RESTO_DIRECCION = RESTO_DIRECCION_PER
+  ;
+
+  keep RUT_JOIN COMUNA_PER DIRECCION_PER CALLE_PER NUMERO_DIR
+       TIPO_PROPIEDAD_PER NUMERO_PROPIEDAD_PER RESTO_DIRECCION_PER;
+run;
+
+/*=============================================================================*
+* 3) DW_PER_GIRO: último giro por RUT (HASH filtro)
+*=============================================================================*/
+data work.per_giro_filt;
+  length RUT_JOIN $10;
+  if _n_=1 then do;
+    declare hash h(dataset:'work.ruts_base');
+    h.defineKey('RUT_JOIN');
+    h.defineDone();
+  end;
+
+  set clsncpop.dw_per_giro(keep=PER_RUT COD_GIRO GLOSA_GIRO FECHA_PROVEEDOR ID);
+
+  RUT_JOIN = upcase(strip(PER_RUT));
+  if h.find()=0 then output;
+run;
+
+proc sort data=work.per_giro_filt;
+  by RUT_JOIN descending FECHA_PROVEEDOR descending ID;
+run;
+
+data work.per_giro_last;
+  set work.per_giro_filt;
+  by RUT_JOIN;
+  if first.RUT_JOIN;
+
+  rename COD_GIRO  = COD_GIRO_PER
+         GLOSA_GIRO= GLOSA_GIRO_PER;
+
+  keep RUT_JOIN COD_GIRO_PER GLOSA_GIRO_PER;
+run;
+
+/*=============================================================================*
+* 4) DW_SEGUROS perimetro: canal/sucursal/medio pago por mes (JOIN a polizas_perim)
+*=============================================================================*/
+
+/* 4.1 Primero filtramos por poliza vía JOIN (evita IN largo en data step) */
+proc sql;
+  create table work.seguros_perim_raw as
+  select
+    upcase(strip(s.RUT_TITULAR)) as RUT_JOIN length=10,
+    strip(s.POLIZA_MADRE)        as POLIZA_JOIN length=50,
+    intnx('month', datepart(s.FEC_VIGENCIA), 0, 'b') as MES_VIGENCIA format=ddmmyy10.,
+    datepart(s.FEC_VIGENCIA) as FEC_VIG_EXACT format=ddmmyy10.,
+    s.MEDIO_PAGO, s.CANAL_VENTA, s.SUCURSAL_VENTA, s.ESTADO,
+    s.DES_PRODUCTO, s.FRECUENCIA, s.PRIMA, s.ID_SEGURO
+  from clsncpop.dw_seguros s
+  inner join work.polizas_perim p
+    on strip(s.POLIZA_MADRE) = p.POLIZA_JOIN
+  ;
+quit;
+
+/* 4.2 Filtrar por universo de RUT con HASH (evita procesar ruts ajenos) */
+data work.seguros_perim;
+  length RUT_JOIN $10;
+  if _n_=1 then do;
+    declare hash h(dataset:'work.ruts_base');
+    h.defineKey('RUT_JOIN');
+    h.defineDone();
+  end;
+
+  set work.seguros_perim_raw;
+  if h.find()=0 then output;
+run;
+
+/* 4.3 Match por RUT+POLIZA+MES y dedup por distancia */
+proc sql;
+  create table work.base_seguros_match as
+  select b.*,
+         s.MEDIO_PAGO     as MEDIO_PAGO_SEG length=100,
+         s.CANAL_VENTA    as CANAL_VENTA_SEG length=4000,
+         s.SUCURSAL_VENTA as SUCURSAL_VENTA_SEG length=100,
+         s.ESTADO         as ESTADO_SEGURO length=50,
+         s.DES_PRODUCTO   as DES_PRODUCTO_SEG length=255,
+         s.FRECUENCIA     as FRECUENCIA_PAGO length=100,
+         s.PRIMA          as PRIMA_SEG,
+         s.ID_SEGURO      as ID_SEGURO_SEG length=50,
+         s.FEC_VIG_EXACT  as FEC_VIGENCIA_EXACT format=ddmmyy10.,
+         abs(s.FEC_VIG_EXACT - b.FEC_OTORGAMIENTO_FINAL) as DIST_FECHA
+  from work.base_enrich b
+  left join work.seguros_perim s
+    on b.RUT_JOIN        = s.RUT_JOIN
+   and b.POLIZA_JOIN     = s.POLIZA_JOIN
+   and b.MES_OTORGAMIENTO= s.MES_VIGENCIA
+  ;
+quit;
+
+proc sort data=work.base_seguros_match;
+  by KEY_CLAIM DIST_FECHA;
+run;
+
+proc sort data=work.base_seguros_match nodupkey;
+  by KEY_CLAIM;
+run;
+
+/*=============================================================================*
+* 5) CONTEOS DE SEGUROS (TODOS productos) - OPTIMIZADO POR MES
+*=============================================================================*/
+
+/* 5.0 Tomamos solo vigencias desde 01jan2021 para ventanas 12M (2022-2025) */
+%let Seg_MinDate = '01jan2021'd;
+
+/* 5.1 Extract “liviano” de DW_SEGUROS solo con columnas para conteo + filtro por RUT via HASH */
+data work.seguros_12m_raw;
+  length RUT_JOIN $10;
+  if _n_=1 then do;
+    declare hash h(dataset:'work.ruts_base');
+    h.defineKey('RUT_JOIN');
+    h.defineDone();
+  end;
+
+  set clsncpop.dw_seguros(keep=RUT_TITULAR ID_SEGURO FEC_VIGENCIA
+    where=(datepart(FEC_VIGENCIA) between &Seg_MinDate and &Fec_Cierre)
+  );
+
+  RUT_JOIN = upcase(strip(RUT_TITULAR));
+  if h.find()=0 then do;
+    MES_VIGENCIA = intnx('month', datepart(FEC_VIGENCIA), 0, 'b');
+    format MES_VIGENCIA ddmmyy10.;
+    output;
+  end;
+
+  keep RUT_JOIN ID_SEGURO MES_VIGENCIA;
+run;
+
+/* 5.2 Agregación mensual por RUT (reduce muchísimo cardinalidad) */
+proc sql;
+  create table work.seguros_mes as
+  select RUT_JOIN,
+         MES_VIGENCIA,
+         count(distinct ID_SEGURO) as N_SEG_MES
+  from work.seguros_12m_raw
+  group by RUT_JOIN, MES_VIGENCIA;
+quit;
+
+/* 5.3 Conteo 12M pre-ocurrencia por siniestro (mes_ocurr -11 a mes_ocurr) */
+proc sql;
+  create table work.count_seg_pre_ocurr as
+  select b.KEY_CLAIM,
+         b.RUT_JOIN,
+         sum(coalesce(s.N_SEG_MES,0)) as N_SEG_12M_PRE_OCURR
+  from work.base_enrich b
+  left join work.seguros_mes s
+    on b.RUT_JOIN = s.RUT_JOIN
+   and s.MES_VIGENCIA between intnx('month', b.MES_OCURRENCIA, -11, 'b') and b.MES_OCURRENCIA
+  group by b.KEY_CLAIM, b.RUT_JOIN;
+quit;
+
+/* 5.4 Conteo 12M previo a fecha referencia (por RUT) */
+proc sql;
+  create table work.count_seg_ref as
+  select RUT_JOIN,
+         sum(N_SEG_MES) as N_SEG_12M_DIC2025
+  from work.seguros_mes
+  where MES_VIGENCIA between intnx('month', intnx('month', &Fec_Ref, 0, 'b'), -11, 'b')
+                        and intnx('month', &Fec_Ref, 0, 'b')
+  group by RUT_JOIN;
+quit;
+
+/* 5.5 Conteo vigentes (sin fecha) - filtrado por RUT via HASH */
+data work.seguros_vig_raw;
+  length RUT_JOIN $10;
+  if _n_=1 then do;
+    declare hash h(dataset:'work.ruts_base');
+    h.defineKey('RUT_JOIN');
+    h.defineDone();
+  end;
+
+  set clsncpop.dw_seguros(keep=RUT_TITULAR ID_SEGURO ESTADO
+    where=(upcase(strip(ESTADO))='VIGENTE')
+  );
+
+  RUT_JOIN = upcase(strip(RUT_TITULAR));
+  if h.find()=0 then output;
+
+  keep RUT_JOIN ID_SEGURO;
+run;
+
+proc sql;
+  create table work.count_seg_vig as
+  select RUT_JOIN, count(distinct ID_SEGURO) as N_SEG_VIGENTES
+  from work.seguros_vig_raw
+  group by RUT_JOIN;
+quit;
+
+/*=============================================================================*
+* 6) SINIESTROS EN OTRAS COBERTURAS (DW_SINIESTROS) - sin NOT IN largo
+*=============================================================================*/
+
+/* 6.1 Tabla de polizas del perimetro para exclusion via LEFT JOIN */
+proc sql;
+  create table work.polizas_perim_small as
+  select distinct POLIZA_JOIN
+  from work.polizas_perim;
+quit;
+
+proc sql;
+  create table work.dw_sin_raw as
+  select
+    upcase(strip(s.RUT_ASEGURADO)) as RUT_JOIN length=10,
+    strip(s.POLIZA_MADRE)          as POLIZA_JOIN length=50,
+    s.NUMERO_SINIESTRO,
+    s.FEC_OCURRENCIA
+  from clsncpop.dw_siniestros s
+  where s.FEC_OCURRENCIA >= '01jan2020'd
+  ;
+quit;
+
+/* 6.2 Filtrar por ruts_base via HASH + excluir perimetro por join */
+data work.dw_sin_filt;
+  length RUT_JOIN $10;
+  if _n_=1 then do;
+    declare hash h(dataset:'work.ruts_base');
+    h.defineKey('RUT_JOIN');
+    h.defineDone();
+  end;
+
+  set work.dw_sin_raw;
+  if h.find()=0 then output;
+run;
+
+proc sql;
+  create table work.dw_sin_otros as
+  select a.*
+  from work.dw_sin_filt a
+  left join work.polizas_perim_small p
+    on a.POLIZA_JOIN = p.POLIZA_JOIN
+  where p.POLIZA_JOIN is null;
+quit;
+
+proc sql;
+  create table work.sin_otras_cob as
+  select RUT_JOIN,
+         count(distinct NUMERO_SINIESTRO) as N_SIN_OTRAS_COB,
+         count(distinct POLIZA_JOIN)      as N_POLIZAS_SINIESTRADAS
+  from work.dw_sin_otros
+  group by RUT_JOIN;
+quit;
+
+/*=============================================================================*
+* 7) DOB (Edad) desde LIB1.ACT_BASE_SINIESTRO, filtrando por NUMERO (hash)
+*=============================================================================*/
+data work.numeros_base;
+  set work.base_enrich(keep=NUMERO_FINAL_C);
+  if NUMERO_FINAL_C ne '' then do;
+    NUMERO_JOIN = input(NUMERO_FINAL_C, best16.);
+    if not missing(NUMERO_JOIN) then output;
+  end;
+  keep NUMERO_JOIN;
+run;
+
+proc sort data=work.numeros_base nodupkey;
+  by NUMERO_JOIN;
+run;
+
+data work.dob_raw;
+  if _n_=1 then do;
+    declare hash hn(dataset:'work.numeros_base');
+    hn.defineKey('NUMERO_JOIN');
+    hn.defineDone();
+  end;
+
+  set lib1.act_base_siniestro(
+    keep=NUMERO ASEGURADOFECNAC POLIZA FECHAOCURRENCIA
+    where=(POLIZA in (&FILTRO_BC_AUX) and FECHAOCURRENCIA >= '01jan2020:0:0:0'dt)
+  );
+
+  NUMERO_JOIN = NUMERO;
+
+  if hn.find()=0 then do;
+    DOB = datepart(ASEGURADOFECNAC);
+    output;
+  end;
+
+  keep NUMERO_JOIN DOB;
+run;
+
+proc sql;
+  create table work.dob_por_numero as
+  select NUMERO_JOIN,
+         min(DOB) as DOB format=ddmmyy10.
+  from work.dob_raw
+  group by NUMERO_JOIN;
+quit;
+
+/*=============================================================================*
+* 8) CONSOLIDACION FINAL
+*=============================================================================*/
+proc sql;
+  create table work.base_enriquecida as
+  select
+    b.*,
+
+    /* geografía */
+    d.COMUNA_PER,
+    d.DIRECCION_PER,
+    d.CALLE_PER,
+    d.NUMERO_DIR,
+    d.TIPO_PROPIEDAD_PER,
+
+    /* giro */
+    g.COD_GIRO_PER,
+    g.GLOSA_GIRO_PER,
+
+    /* conteos seguros */
+    coalesce(cpre.N_SEG_12M_PRE_OCURR,0) as N_SEG_12M_PRE_OCURR,
+    coalesce(cref.N_SEG_12M_DIC2025,0)   as N_SEG_12M_DIC2025,
+    coalesce(cvig.N_SEG_VIGENTES,0)      as N_SEG_VIGENTES,
+
+    /* siniestralidad cruzada */
+    coalesce(sx.N_SIN_OTRAS_COB,0)        as N_SIN_OTRAS_COB,
+    coalesce(sx.N_POLIZAS_SINIESTRADAS,0) as N_POLIZAS_SINIESTRADAS,
+
+    /* DOB */
+    dob.DOB as DOB format=ddmmyy10.
+
+  from work.base_seguros_match b
+  left join work.per_dire_last         d   on b.RUT_JOIN  = d.RUT_JOIN
+  left join work.per_giro_last         g   on b.RUT_JOIN  = g.RUT_JOIN
+  left join work.count_seg_pre_ocurr   cpre on b.KEY_CLAIM = cpre.KEY_CLAIM
+  left join work.count_seg_ref         cref on b.RUT_JOIN  = cref.RUT_JOIN
+  left join work.count_seg_vig         cvig on b.RUT_JOIN  = cvig.RUT_JOIN
+  left join work.sin_otras_cob         sx   on b.RUT_JOIN  = sx.RUT_JOIN
+  left join work.dob_por_numero        dob  on input(b.NUMERO_FINAL_C, best16.) = dob.NUMERO_JOIN
+  ;
+quit;
+
+/*=============================================================================*
+* 9) VARIABLES DERIVADAS (Doc2)
+*=============================================================================*/
+data work.base_enriquecida;
+  set work.base_enriquecida;
+
+  /* 9.1 Edad al siniestro */
+  if not missing(DOB) and not missing(FEC_OCURRENCIA_FINAL) then
+    EDAD_AL_SINIESTRO = floor(yrdif(DOB, FEC_OCURRENCIA_FINAL, 'AGE'));
+  else EDAD_AL_SINIESTRO = .;
+
+  /* 9.2 Día semana + fin de semana */
+  if not missing(FEC_OCURRENCIA_FINAL) then do;
+    DIA_SEMANA_OCURR = weekday(FEC_OCURRENCIA_FINAL);
+    FLAG_FIN_SEMANA  = (DIA_SEMANA_OCURR in (1,7));
+  end;
+
+  /* 9.3 Periodo (mes) para análisis */
+  if not missing(FEC_OCURRENCIA_FINAL) then do;
+    PERIODO_OCURRENCIA = intnx('month', FEC_OCURRENCIA_FINAL, 0, 'b');
+    ANIO_OCURRENCIA    = year(FEC_OCURRENCIA_FINAL);
+    MES_OCURRENCIA_N   = month(FEC_OCURRENCIA_FINAL);
+    format PERIODO_OCURRENCIA yymmn6.;
+  end;
+
+  /* 9.4 Tramos DIF_VIGENCIA */
+  length TRAMO_DIF_VIG $12;
+  if not missing(DIF_VIGENCIA) then do;
+    if DIF_VIGENCIA < 31 then TRAMO_DIF_VIG = '1.<31';
+    else if DIF_VIGENCIA < 60 then TRAMO_DIF_VIG = '2.31-59';
+    else if DIF_VIGENCIA < 90 then TRAMO_DIF_VIG = '3.60-89';
+    else if DIF_VIGENCIA < 180 then TRAMO_DIF_VIG = '4.90-179';
+    else if DIF_VIGENCIA < 365 then TRAMO_DIF_VIG = '5.180-364';
+    else TRAMO_DIF_VIG = '6.365+';
+  end;
+  else TRAMO_DIF_VIG = '';
+
+  /* 9.5 Tramos USO_TOPE */
+  length TRAMO_USO_TOPE $12;
+  if not missing(USO_TOPE) then do;
+    if USO_TOPE < 0.5 then TRAMO_USO_TOPE = '1.<50%';
+    else if USO_TOPE < 0.7 then TRAMO_USO_TOPE = '2.50-69';
+    else if USO_TOPE < 0.8 then TRAMO_USO_TOPE = '3.70-79';
+    else if USO_TOPE < 0.9 then TRAMO_USO_TOPE = '4.80-89';
+    else if USO_TOPE < 1.0 then TRAMO_USO_TOPE = '5.90-99';
+    else TRAMO_USO_TOPE = '6.100+';
+  end;
+  else TRAMO_USO_TOPE = '';
+
+  /* 9.6 Flags evasión + compuesto */
+  FLAG_EVASION_DIF31_45   = (31 <= DIF_VIGENCIA <= 45);
+  FLAG_EVASION_TOPE_75_80 = (0.75 <= USO_TOPE < 0.8);
+  FLAG_EVASION_AMBOS      = (FLAG_EVASION_DIF31_45=1 and FLAG_EVASION_TOPE_75_80=1);
+
+  /* 9.7 Quiebre post agosto 2024 */
+  if not missing(FEC_OCURRENCIA_FINAL) then
+    FLAG_POST_AGO2024 = (FEC_OCURRENCIA_FINAL >= '01aug2024'd);
+  else FLAG_POST_AGO2024 = .;
+
+  /* 9.8 Tramo edad */
+  length TRAMO_EDAD $12;
+  if not missing(EDAD_AL_SINIESTRO) then do;
+    if EDAD_AL_SINIESTRO < 25 then TRAMO_EDAD = '1.<25';
+    else if EDAD_AL_SINIESTRO < 35 then TRAMO_EDAD = '2.25-34';
+    else if EDAD_AL_SINIESTRO < 45 then TRAMO_EDAD = '3.35-44';
+    else if EDAD_AL_SINIESTRO < 55 then TRAMO_EDAD = '4.45-54';
+    else if EDAD_AL_SINIESTRO < 65 then TRAMO_EDAD = '5.55-64';
+    else TRAMO_EDAD = '6.65+';
+  end;
+  else TRAMO_EDAD = '';
+
+  /* 9.9 Flags compuestos */
+  FLAG_MULTI_SEGURO = (N_SEG_12M_PRE_OCURR >= 3);
+  FLAG_SIN_CRUZADA  = (N_SIN_OTRAS_COB > 0);
+  FLAG_MULTI_Y_CRUZ = (FLAG_MULTI_SEGURO=1 and FLAG_SIN_CRUZADA=1);
+
+run;
+
+/*=============================================================================*
+* 10) DIAGNOSTICO MATCH
+*=============================================================================*/
+title "=== Diagnostico: Tasa de match de variables enriquecidas ===";
+proc sql;
+  select
+    count(*) as TOTAL_REGISTROS,
+
+    sum(case when COMUNA_PER ne '' then 1 else 0 end) as N_CON_COMUNA,
+    calculated N_CON_COMUNA / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_COMUNA,
+
+    sum(case when CANAL_VENTA_SEG ne '' then 1 else 0 end) as N_CON_CANAL,
+    calculated N_CON_CANAL / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_CANAL,
+
+    sum(case when SUCURSAL_VENTA_SEG ne '' then 1 else 0 end) as N_CON_SUCURSAL,
+    calculated N_CON_SUCURSAL / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_SUCURSAL,
+
+    sum(case when MEDIO_PAGO_SEG ne '' then 1 else 0 end) as N_CON_MEDIO_PAGO,
+    calculated N_CON_MEDIO_PAGO / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_MEDIO_PAGO,
+
+    sum(case when GLOSA_GIRO_PER ne '' then 1 else 0 end) as N_CON_GIRO,
+    calculated N_CON_GIRO / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_GIRO
+  from work.base_enriquecida;
+quit;
+title;
+
+/*=============================================================================*
+* 11) TABLAS “POR QUÉ DEL PICO”: concentraciones pre/post AGO-2024
+*=============================================================================*/
+title "Top 30 COMUNAS por concentracion (pre vs post AGO-2024)";
+proc sql outobs=30;
+  select COMUNA_PER,
+         sum(case when FLAG_POST_AGO2024=0 then 1 else 0 end) as N_PRE,
+         sum(case when FLAG_POST_AGO2024=1 then 1 else 0 end) as N_POST,
+         calculated N_POST / (calculated N_PRE + calculated N_POST) * 100 format=6.1 as PCT_POST,
+         sum(case when SOSPECHA_FINAL>=2 then 1 else 0 end) as N_SOSPECHOSOS
+  from work.base_enriquecida
+  where COMUNA_PER ne ''
+  group by COMUNA_PER
+  order by N_POST desc;
+quit;
+title;
+
+title "Top 30 CANALES por concentracion (pre vs post AGO-2024)";
+proc sql outobs=30;
+  select CANAL_VENTA_SEG,
+         sum(case when FLAG_POST_AGO2024=0 then 1 else 0 end) as N_PRE,
+         sum(case when FLAG_POST_AGO2024=1 then 1 else 0 end) as N_POST,
+         calculated N_POST / (calculated N_PRE + calculated N_POST) * 100 format=6.1 as PCT_POST,
+         sum(case when SOSPECHA_FINAL>=2 then 1 else 0 end) as N_SOSPECHOSOS
+  from work.base_enriquecida
+  where CANAL_VENTA_SEG ne ''
+  group by CANAL_VENTA_SEG
+  order by N_POST desc;
+quit;
+title;
+
+title "Top 30 SUCURSALES por concentracion (pre vs post AGO-2024)";
+proc sql outobs=30;
+  select SUCURSAL_VENTA_SEG,
+         sum(case when FLAG_POST_AGO2024=0 then 1 else 0 end) as N_PRE,
+         sum(case when FLAG_POST_AGO2024=1 then 1 else 0 end) as N_POST,
+         calculated N_POST / (calculated N_PRE + calculated N_POST) * 100 format=6.1 as PCT_POST,
+         sum(case when SOSPECHA_FINAL>=2 then 1 else 0 end) as N_SOSPECHOSOS
+  from work.base_enriquecida
+  where SUCURSAL_VENTA_SEG ne ''
+  group by SUCURSAL_VENTA_SEG
+  order by N_POST desc;
+quit;
+title;
+
+title "MEDIO_PAGO por concentracion (pre vs post AGO-2024)";
+proc sql;
+  select MEDIO_PAGO_SEG,
+         sum(case when FLAG_POST_AGO2024=0 then 1 else 0 end) as N_PRE,
+         sum(case when FLAG_POST_AGO2024=1 then 1 else 0 end) as N_POST,
+         calculated N_POST / (calculated N_PRE + calculated N_POST) * 100 format=6.1 as PCT_POST
+  from work.base_enriquecida
+  where MEDIO_PAGO_SEG ne ''
+  group by MEDIO_PAGO_SEG
+  order by N_POST desc;
+quit;
+title;
+
+/*=============================================================================*
+* 12) OUTPUTS
+*=============================================================================*/
+data Salidas.ROBO_ENRIQUECIDA;
+  set work.base_enriquecida;
+run;
+
+proc export
+  data=work.base_enriquecida
+  dbms=xlsx
+  outfile="/sasdata/Proyectos/Estudios/ROBO_ENRIQUECIDA_DIC2025.xlsx"
+  replace;
+  sheet="BASE_ENRIQUECIDA";
+run;
+
+/*=============================================================================*
+* 13) LIMPIEZA (intermedias pesadas)
+*=============================================================================*/
+proc datasets library=work nolist;
+  delete per_dire_filt per_dire_last
+         per_giro_filt per_giro_last
+         seguros_perim_raw seguros_perim
+         seguros_perim_raw seguros_perim2
+         seguros_12m_raw seguros_mes
+         seguros_vig_raw
+         dw_sin_raw dw_sin_filt dw_sin_otros
+         dob_raw dob_por_numero numeros_base
+         base_seguros_match
+         count_seg_pre_ocurr count_seg_ref count_seg_vig
+         sin_otras_cob
+         ruts_base polizas_perim polizas_perim_small filtro_bc;
+quit;
