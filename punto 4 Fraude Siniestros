@@ -1,0 +1,152 @@
+/*==============================================================*
+* 4) MATCH DW_SEGUROS sin tabla intermedia (evita WORK full)
+*    Output: WORK.MATCH_BEST (1 fila por KEY_CLAIM)
+*==============================================================*/
+
+options compress=yes;   /* reduce espacio en WORK; quítalo si CPU es crítico */
+
+/* 4.0) bounds datetime para recortar DW_SEGUROS por vigencia */
+proc sql noprint;
+  select min(MES_OTORGAMIENTO), max(MES_OTORGAMIENTO)
+    into :MIN_MES_OTORG, :MAX_MES_OTORG
+  from work.base_enrich;
+quit;
+
+data _null_;
+  min_mes = input(symget('MIN_MES_OTORG'), best.);
+  max_mes = input(symget('MAX_MES_OTORG'), best.);
+
+  /* Si por el INTO quedan vacíos, cae a fechas del proyecto */
+  if missing(min_mes) then min_mes = intnx('month', &Fec_Inicio, 0, 'b');
+  if missing(max_mes) then max_mes = intnx('month', &Fec_Cierre, 0, 'b');
+
+  dt_min = dhms(min_mes, 0,0,0);
+  dt_max = dhms(intnx('month', max_mes, 1, 'b'), 0,0,0);
+
+  call symputx('DT_MIN', dt_min);
+  call symputx('DT_MAX', dt_max);
+run;
+
+/* 4.1) Streaming match: best match por KEY_CLAIM */
+data _null_;
+  length
+    /* keys para hash base */
+    RUT_JOIN $10 POLIZA_JOIN $50
+    KEY_CLAIM $40
+    /* campos del match que guardaremos */
+    MEDIO_PAGO_SEG $100
+    CANAL_VENTA_SEG $4000
+    SUCURSAL_VENTA_SEG $100
+    ESTADO_SEGURO $50
+    DES_PRODUCTO_SEG $255
+    FRECUENCIA_PAGO $100
+    ID_SEGURO_SEG $50
+  ;
+  format FEC_VIGENCIA_EXACT ddmmyy10.;
+  retain BEST_DIST;
+
+  /*--- Hash con las filas base (multidata porque pueden existir varias por misma key) ---*/
+  if 0 then set work.base_enrich(keep=RUT_JOIN POLIZA_JOIN MES_OTORGAMIENTO KEY_CLAIM FEC_OTORGAMIENTO_FINAL);
+
+  declare hash hb(dataset:'work.base_enrich(keep=RUT_JOIN POLIZA_JOIN MES_OTORGAMIENTO KEY_CLAIM FEC_OTORGAMIENTO_FINAL)',
+                  multidata:'y');
+  hb.defineKey('RUT_JOIN','POLIZA_JOIN','MES_OTORGAMIENTO');
+  hb.defineData('KEY_CLAIM','FEC_OTORGAMIENTO_FINAL');
+  hb.defineDone();
+
+  /*--- Hash con el mejor match por claim ---*/
+  declare hash hbest();
+  hbest.defineKey('KEY_CLAIM');
+  hbest.defineData('KEY_CLAIM','BEST_DIST',
+                   'MEDIO_PAGO_SEG','CANAL_VENTA_SEG','SUCURSAL_VENTA_SEG',
+                   'ESTADO_SEGURO','DES_PRODUCTO_SEG','FRECUENCIA_PAGO',
+                   'PRIMA_SEG','ID_SEGURO_SEG','FEC_VIGENCIA_EXACT');
+  hbest.defineDone();
+
+  /*--- Hash de RUT universo ---*/
+  declare hash hR(dataset:'work.ruts_base');
+  hR.defineKey('RUT_JOIN');
+  hR.defineDone();
+
+  /*--- Hash de pólizas perímetro ---*/
+  declare hash hP(dataset:'work.polizas_perim');
+  hP.defineKey('POLIZA_JOIN');
+  hP.defineDone();
+
+  /*--- Scan único a DW_SEGUROS acotado por fechas ---*/
+  do until(eof);
+    set clsncpop.dw_seguros(
+      keep=RUT_TITULAR POLIZA_MADRE FEC_VIGENCIA
+           MEDIO_PAGO CANAL_VENTA SUCURSAL_VENTA ESTADO
+           DES_PRODUCTO FRECUENCIA PRIMA ID_SEGURO
+      where=(FEC_VIGENCIA >= &DT_MIN and FEC_VIGENCIA < &DT_MAX)
+    ) end=eof;
+
+    RUT_JOIN    = upcase(strip(RUT_TITULAR));
+    POLIZA_JOIN = strip(POLIZA_MADRE);
+
+    /* filtrar rápido por universo */
+    if hR.find() ne 0 then continue;
+    if hP.find() ne 0 then continue;
+
+    FEC_VIGENCIA_EXACT = datepart(FEC_VIGENCIA);
+    MES_OTORGAMIENTO   = intnx('month', FEC_VIGENCIA_EXACT, 0, 'b');
+
+    /* buscar si esta key existe en base */
+    rc = hb.find();
+    if rc ne 0 then continue;
+
+    /* mover campos del seguro a nombres “_SEG” */
+    MEDIO_PAGO_SEG      = MEDIO_PAGO;
+    CANAL_VENTA_SEG     = CANAL_VENTA;
+    SUCURSAL_VENTA_SEG  = SUCURSAL_VENTA;
+    ESTADO_SEGURO       = ESTADO;
+    DES_PRODUCTO_SEG    = DES_PRODUCTO;
+    FRECUENCIA_PAGO     = FRECUENCIA;
+    PRIMA_SEG           = PRIMA;
+    ID_SEGURO_SEG       = ID_SEGURO;
+
+    /* por cada fila base que comparte (RUT,POLIZA,MES), elegir mejor distancia */
+    do while (rc = 0);
+      dist = abs(FEC_VIGENCIA_EXACT - FEC_OTORGAMIENTO_FINAL);
+
+      rc2 = hbest.find(); /* busca por KEY_CLAIM (viene desde hb.defineData) */
+
+      if rc2 ne 0 then do; /* no existe aún */
+        BEST_DIST = dist;
+        hbest.add();
+      end;
+      else if dist < BEST_DIST then do; /* reemplazar si mejora */
+        BEST_DIST = dist;
+        hbest.replace();
+      end;
+
+      rc = hb.find_next();
+    end;
+  end;
+
+  /* output del hash (pequeño) */
+  hbest.output(dataset:'work.match_best(compress=yes)');
+
+  stop;
+run;
+
+/* 4.2) Construir BASE_SEGUROS_MATCH (sin tabla gigante intermedia) */
+proc sql;
+  create table work.base_seguros_match(compress=yes) as
+  select b.*,
+         m.MEDIO_PAGO_SEG,
+         m.CANAL_VENTA_SEG,
+         m.SUCURSAL_VENTA_SEG,
+         m.ESTADO_SEGURO,
+         m.DES_PRODUCTO_SEG,
+         m.FRECUENCIA_PAGO,
+         m.PRIMA_SEG,
+         m.ID_SEGURO_SEG,
+         m.FEC_VIGENCIA_EXACT as FEC_VIGENCIA_EXACT format=ddmmyy10.,
+         m.BEST_DIST as DIST_FECHA
+  from work.base_enrich b
+  left join work.match_best m
+    on b.KEY_CLAIM = m.KEY_CLAIM
+  ;
+quit;
