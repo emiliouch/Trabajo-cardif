@@ -1,8 +1,8 @@
 /*=============================================================================*
-* MODULO ENRIQUECIMIENTO + VARIABLES ANALITICAS (Doc1 actualizado con Doc2)
+* MODULO ENRIQUECIMIENTO + VARIABLES ANALITICAS 
 *
 * Input  : SALIDAS.ROBO_ENERO2025  (output del pipeline de siniestros)
-* Output : SALIDAS.ROBO_ENRIQUECIDA (tabla) + Excel en /sasdata/Proyectos/Estudios
+* Output : SALIDAS.ROBO_ENRIQUECIDA (tabla)
 *
 * Nota: Se ejecuta DESPUES del codigo principal de siniestros.
 *=============================================================================*/
