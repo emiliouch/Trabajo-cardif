@@ -10,7 +10,7 @@
 /*-----------------------------*
 * 0) PARAMETROS
 *-----------------------------*/
-%let Fec_Inicio = '01jan2022'd;
+%let Fec_Inicio = '01jan2020'd;
 %let Fec_Cierre = '31dec2025'd;
 %let Fec_Ref    = '31dec2025'd;
 
