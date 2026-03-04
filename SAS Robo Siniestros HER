@@ -1,7 +1,29 @@
-data work.RUT_SOSPECHOSOS_DICTAMEN_APROBAD;
-    SET WORK.RUT_SOSPECHOSOS_DICTAMEN_APROBAD(firstobs=2);
-    RENAME F1=RUT_FINAL;
-RUN;
+data work.RUT_SOSPECHOSOS_CLEAN;
+  set work.RUT_SOSPECHOSOS_DICTAMEN_APROBAD;  /* ya viene con RUT_FINAL */
+run;
+
+data work.RUT_SOSPECHOSOS_KEY;
+  set work.RUT_SOSPECHOSOS_CLEAN;
+
+  length RUT_JOIN10 $10 _rut_clean $40 _dv $1 _num $32;
+
+  _rut_clean = upcase(compress(strip(RUT_FINAL), '-. '));
+
+  if missing(_rut_clean) then RUT_JOIN10 = '';
+  else do;
+    _dv  = substr(_rut_clean, length(_rut_clean), 1);
+    _num = substr(_rut_clean, 1, length(_rut_clean)-1);
+
+    /* deja solo dígitos y pad a 9 */
+    _num = compress(_num, , 'kd');
+    if length(_num) > 9 then _num = substr(_num, length(_num)-8);
+    if length(_num) < 9 then _num = cats(repeat('0', 9-length(_num)), _num);
+
+    RUT_JOIN10 = cats(_num, _dv);
+  end;
+
+  drop _rut_clean _dv _num;
+run;
 PROC SQL;
     CREATE TABLE WORK.FILTRO_BC AS
     SELECT DISTINCT T1.POLIZA
@@ -472,33 +494,28 @@ FULL OUTER JOIN WORK.AGRUPADOS T2 ON T1.NUMERO_SIN = T2.NUMERO;
 QUIT;
 
 data work.DW_SINIESTROS_AUX2_KEY;
-    set work.DW_SINIESTROS_AUX2;
-    length RUT_NUM 8;
+  set work.DW_SINIESTROS_AUX2;
 
-    /* Si RUT_FINAL es numérico, lo usamos directo.
-       Si es char (con DV), tomamos los primeros 9 dígitos (con ceros) y lo pasamos a num. */
-    if vtype(RUT_FINAL) = 'N' then do;
-        RUT_NUM = RUT_FINAL;
-    end;
-    else do;
-        /* Limpia puntos/guiones/espacios y deja en mayúscula */
-        _rut_clean = upcase(compress(strip(RUT_FINAL), '-. '));
-        /* Parte numérica (9 chars con ceros a la izquierda) */
-        RUT_NUM = input(substr(_rut_clean, 1, 9), 9.);
-    end;
+  length RUT_JOIN10 $10 _rut_clean $40 _dv $1 _num $32;
 
-    drop _rut_clean;
+  _rut_clean = upcase(compress(strip(RUT_FINAL), '-. '));
+
+  if missing(_rut_clean) then RUT_JOIN10 = '';
+  else do;
+    _dv  = substr(_rut_clean, length(_rut_clean), 1);
+    _num = substr(_rut_clean, 1, length(_rut_clean)-1);
+
+    /* deja solo dígitos, pad a 9 */
+    _num = compress(_num, , 'kd');
+    if length(_num) > 9 then _num = substr(_num, length(_num)-8);
+    if length(_num) < 9 then _num = cats(repeat('0', 9-length(_num)), _num);
+
+    RUT_JOIN10 = cats(_num, _dv);
+  end;
+
+  drop _rut_clean _dv _num;
 run;
 
-data work.RUT_SOSPECHOSOS_DICTAMEN_APROB_KEY;
-    set work.RUT_SOSPECHOSOS_DICTAMEN_APROB;
-    length RUT_NUM 8;
-
-    _rut_clean = upcase(compress(strip(RUT_FINAL), '-. '));
-    RUT_NUM = input(substr(_rut_clean, 1, 9), 9.);
-
-    drop _rut_clean;
-run;
 
 PROC SQL;
 CREATE TABLE WORK.DW_SINIESTROS_AUX3 AS
@@ -543,7 +560,7 @@ FROM WORK.DW_SINIESTROS_AUX6 t1
 GROUP BY t1.RUT_FINAL;
 QUIT;
 
-PPROC SQL;
+PROC SQL;
 CREATE TABLE WORK.DW_SINIESTROS_AUX8 AS
 SELECT  t1.*,
         t2.SUM_of_MONTO_PESOS,
@@ -564,7 +581,7 @@ LEFT JOIN LIB1.ACT_RIESGO t3 ON t1.RIESGO_OPERACIONES_FINAL = t3.RIESGOOPERACION
 LEFT JOIN WORK.DW_SINIESTROS_AUX5 t4 ON t1.RUT_FINAL=t4.RUT_FINAL
 LEFT JOIN WORK.DW_SINIESTROS_AUX7 t5 ON t1.RUT_FINAL=t5.RUT_FINAL
 LEFT JOIN WORK.'Investigaciones Robo'n t6 ON t6.NumeroSiniestro = t1.NUMERO_FINAL
-LEFT JOIN WORK.RUT_SOSPECHOSOS_DICTAMEN_APROB_KEY t7 ON t1.RUT_NUM = t7.RUT_NUM;
+LEFT JOIN WORK.RUT_SOSPECHOSOS_KEY t7 ON t1.RUT_JOIN10 = t7.RUT_JOIN10;
 QUIT;
 
 DATA WORK.DW_SINIESTROS_AUX9;
@@ -595,15 +612,15 @@ ELSE PLAN_AUX=DES_PLAN;
 
 IF PLAN_AUX = 'PLAN 1' AND POLIZA_FINAL IN ('123037525','123037526') THEN PLAN_AUX = 'PLAN TRADICIONAL';
 
-IF find(RIESGOSDSC,'COMPRA PROTEGIDA X DA?O ACCIDENTAL') THEN COB='COMPRA PROTEGIDA X DANO ACCIDENTAL';
-ELSE IF find(RIESGOSDSC,'COMPRA') THEN COB='COMPRA PROTEGIDA X ROBO';
-ELSE IF find(RIESGOSDSC,'EXTORSION') THEN COB='EXTORSION O ENGANO';
-ELSE IF find(RIESGOSDSC,'PROT PAT') OR find(RIESGOSDSC,'PROTEC PATRIM') OR FIND(RIESGOSDSC,'PROTECCION PATRIMONIAL') OR FIND(RIESGOSDSC,'P.P.') THEN COB='ROBO DOCUMENTOS';
-ELSE IF find(RIESGOSDSC,'CHEQ') THEN COB='ROBO CHEQUES';
-ELSE IF find(RIESGOSDSC,'INTIMID') THEN COB='ROBO COSAS';
-ELSE IF find(RIESGOSDSC,'VENTANILLA') THEN COB='ROBO DINERO CAJERO';
-ELSE IF find(RIESGOSDSC,'CAJEROS') OR find(RIESGOSDSC,'C.A') THEN COB='ROBO DINERO VENTANILLA';
-ELSE COB=RIESGOSDSC;
+IF find(RIESGODSC,'COMPRA PROTEGIDA X DA?O ACCIDENTAL') THEN COB='COMPRA PROTEGIDA X DANO ACCIDENTAL';
+ELSE IF find(RIESGODSC,'COMPRA') THEN COB='COMPRA PROTEGIDA X ROBO';
+ELSE IF find(RIESGODSC,'EXTORSION') THEN COB='EXTORSION O ENGANO';
+ELSE IF find(RIESGODSC,'PROT PAT') OR find(RIESGODSC,'PROTEC PATRIM') OR FIND(RIESGODSC,'PROTECCION PATRIMONIAL') OR FIND(RIESGODSC,'P.P.') THEN COB='ROBO DOCUMENTOS';
+ELSE IF find(RIESGODSC,'CHEQ') THEN COB='ROBO CHEQUES';
+ELSE IF find(RIESGODSC,'INTIMID') THEN COB='ROBO COSAS';
+ELSE IF find(RIESGODSC,'VENTANILLA') THEN COB='ROBO DINERO CAJERO';
+ELSE IF find(RIESGODSC,'CAJEROS') OR find(RIESGODSC,'C.A') THEN COB='ROBO DINERO VENTANILLA';
+ELSE COB=RIESGODSC;
 
 IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 1' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 15;
 ELSE IF POLIZA_FINAL='121057429' AND PLAN_AUX = 'PLAN 2' AND COB = 'COMPRA PROTEGIDA X ROBO' THEN TOPE = 20;
