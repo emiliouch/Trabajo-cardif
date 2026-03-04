@@ -1,0 +1,523 @@
+/*=============================================================================*
+* MODULO ENRIQUECIMIENTO + VARIABLES ANALITICAS
+*
+* Input  : SALIDAS.ROBO_ENERO2025  (output del pipeline de siniestros)
+* Output : SALIDAS.ROBO_ENRIQUECIDA (tabla) + Excel en /sasdata/Proyectos/Estudios
+*
+* Nota: Se ejecuta DESPUES del codigo principal de siniestros.
+*=============================================================================*/
+
+/*-----------------------------*
+* 0) PARAMETROS
+*-----------------------------*/
+%let Fec_Inicio = '01jan2022'd;
+%let Fec_Cierre = '31dec2025'd;
+%let Fec_Ref    = '31dec2025'd;
+
+libname Salidas "/sasdata/Proyectos";
+
+/*-----------------------------*
+* 0.1) Asegurar macro &FILTRO_BC_AUX (polizas perimetro)
+*      Si ya existe por el pipeline del colega, no se recalcula.
+*-----------------------------*/
+%macro ensure_filtro_bc_aux;
+  %if not %symexist(FILTRO_BC_AUX) %then %do;
+
+    proc sql;
+      create table work.filtro_bc as
+      select distinct put(Poliza, best12.) as POLIZA_CHAR length=15
+      from work.base_correspondencia
+      where upcase(strip('Familia de Riesgo'n)) = 'FRAUDE';
+    quit;
+
+    proc sql noprint;
+      select quote(trim(POLIZA_CHAR), "'") into :FILTRO_BC_AUX separated by ','
+      from work.filtro_bc;
+    quit;
+
+    %put NOTE: FILTRO_BC_AUX construido localmente = &FILTRO_BC_AUX;
+
+  %end;
+%mend;
+%ensure_filtro_bc_aux;
+
+/*-----------------------------*
+* 0.2) Normalizacion de RUT (canonico Char(10): 9 digitos + DV)
+*-----------------------------*/
+options cmplib=work.funcs;
+
+proc fcmp outlib=work.funcs.util;
+  function norm_rut(rut_in $) $10;
+    length s $64 num $64 dv $1 out $10 pad $16;
+    s = upcase(strip(rut_in));
+    s = prxchange('s/[^0-9A-Z]//o', -1, s);
+
+    if missing(s) or length(s) < 2 then return('');
+
+    dv  = substr(s, length(s), 1);
+    num = substr(s, 1, length(s)-1);
+
+    num = prxchange('s/[^0-9]//o', -1, num);
+    if missing(num) or missing(dv) then return('');
+
+    if length(num) > 9 then num = substr(num, length(num)-8);
+    pad = repeat('0', max(0, 9-length(num)));
+    num = cats(pad, num);
+
+    out = cats(num, dv);
+    return(out);
+  endsub;
+run;
+
+/*=============================================================================*
+* 1) INPUT BASE: cargar y preparar llaves
+*=============================================================================*/
+data work.base_enrich;
+  set Salidas.ROBO_ENERO2025;
+
+  /* filtro periodo de análisis */
+  if &Fec_Inicio <= FEC_OCURRENCIA_FINAL <= &Fec_Cierre;
+
+  length RUT_JOIN $10 POLIZA_JOIN $50 NUMERO_FINAL_C $32 KEY_CLAIM $40;
+
+  /* RUT canonico para cruces */
+  RUT_JOIN = norm_rut(RUT_FINAL);
+
+  /* POLIZA canonica (maneja si POLIZA_FINAL es char o num) */
+  if vtype(POLIZA_FINAL)='N' then POLIZA_JOIN = strip(put(POLIZA_FINAL, best16.));
+  else POLIZA_JOIN = strip(POLIZA_FINAL);
+
+  /* NUMERO_FINAL a char (para key fallback / debugging) */
+  if vtype(NUMERO_FINAL)='N' then NUMERO_FINAL_C = strip(put(NUMERO_FINAL, best16.));
+  else NUMERO_FINAL_C = strip(NUMERO_FINAL);
+
+  /* key robusta por reclamo */
+  if not missing(ID) then KEY_CLAIM = cats('ID=', strip(put(ID, best16.)));
+  else if not missing(NUMERO_FINAL_C) then KEY_CLAIM = cats('N=', NUMERO_FINAL_C);
+  else KEY_CLAIM = cats('ROW=', put(_n_, best16.));
+
+  /* "mes" para cruce DW_SEGUROS (nivel mes real) */
+  MES_OTORGAMIENTO = intnx('month', FEC_OTORGAMIENTO_FINAL, 0, 'b');
+  format MES_OTORGAMIENTO ddmmyy10.;
+
+  /* flags evasión (útiles incluso antes de derivadas finales) */
+  FLAG_EVASION_DIF31_45  = (31 <= DIF_VIGENCIA <= 45);
+  FLAG_EVASION_TOPE_75_80= (0.75 <= USO_TOPE < 0.8);
+
+run;
+
+/* lista de RUTs para acelerar queries grandes */
+proc sql;
+  create table work.ruts_base as
+  select distinct RUT_JOIN
+  from work.base_enrich
+  where RUT_JOIN ne '';
+quit;
+
+/*=============================================================================*
+* 2) DW_PER_DIRE: ultimo registro por RUT (solo ruts del universo)
+*=============================================================================*/
+data work.per_dire_prep;
+  set clsncpop.dw_per_dire(
+    keep=ID PER_RUT COMUNA DIRECCION CALLE NUMERO TIPO_PROPIEDAD NUMERO_PROPIEDAD RESTO_DIRECCION FEC_ACT_REGISTRO
+  );
+  RUT_JOIN = norm_rut(PER_RUT);
+run;
+
+proc sql;
+  create table work.per_dire_prep2 as
+  select d.*
+  from work.per_dire_prep d
+  inner join work.ruts_base r
+    on d.RUT_JOIN = r.RUT_JOIN;
+quit;
+
+proc sort data=work.per_dire_prep2;
+  by RUT_JOIN descending FEC_ACT_REGISTRO descending ID;
+run;
+
+data work.per_dire_last;
+  set work.per_dire_prep2;
+  by RUT_JOIN;
+  if first.RUT_JOIN;
+
+  rename
+    COMUNA          = COMUNA_PER
+    DIRECCION       = DIRECCION_PER
+    CALLE           = CALLE_PER
+    NUMERO          = NUMERO_DIR
+    TIPO_PROPIEDAD  = TIPO_PROPIEDAD_PER
+    NUMERO_PROPIEDAD= NUMERO_PROPIEDAD_PER
+    RESTO_DIRECCION = RESTO_DIRECCION_PER
+  ;
+  keep RUT_JOIN COMUNA_PER DIRECCION_PER CALLE_PER NUMERO_DIR
+       TIPO_PROPIEDAD_PER NUMERO_PROPIEDAD_PER RESTO_DIRECCION_PER;
+run;
+
+/*=============================================================================*
+* 3) DW_PER_GIRO: ultimo giro por RUT (solo ruts del universo)
+*=============================================================================*/
+data work.per_giro_prep;
+  set clsncpop.dw_per_giro(keep=ID PER_RUT COD_GIRO GLOSA_GIRO FECHA_PROVEEDOR);
+  RUT_JOIN = norm_rut(PER_RUT);
+run;
+
+proc sql;
+  create table work.per_giro_prep2 as
+  select g.*
+  from work.per_giro_prep g
+  inner join work.ruts_base r
+    on g.RUT_JOIN = r.RUT_JOIN;
+quit;
+
+proc sort data=work.per_giro_prep2;
+  by RUT_JOIN descending FECHA_PROVEEDOR descending ID;
+run;
+
+data work.per_giro_last;
+  set work.per_giro_prep2;
+  by RUT_JOIN;
+  if first.RUT_JOIN;
+
+  rename COD_GIRO  = COD_GIRO_PER
+         GLOSA_GIRO= GLOSA_GIRO_PER;
+  keep RUT_JOIN COD_GIRO_PER GLOSA_GIRO_PER;
+run;
+
+/*=============================================================================*
+* 4) DW_SEGUROS (perimetro): canal/sucursal/medio pago por mes, con dedup por cercania
+*=============================================================================*/
+data work.seguros_perim;
+  set clsncpop.dw_seguros(
+    keep=RUT_TITULAR POLIZA_MADRE FEC_VIGENCIA MEDIO_PAGO CANAL_VENTA SUCURSAL_VENTA ESTADO
+         DES_PRODUCTO FRECUENCIA PRIMA ID_SEGURO
+  );
+
+  RUT_JOIN    = norm_rut(RUT_TITULAR);
+  POLIZA_JOIN = strip(POLIZA_MADRE);
+
+  /* mes para join */
+  MES_VIGENCIA = intnx('month', datepart(FEC_VIGENCIA), 0, 'b');
+  FEC_VIG_EXACT= datepart(FEC_VIGENCIA);
+
+  format MES_VIGENCIA ddmmyy10. FEC_VIG_EXACT ddmmyy10.;
+
+  /* filtro poliza perimetro */
+  if strip(POLIZA_MADRE) in (&FILTRO_BC_AUX);
+run;
+
+/* reducir a ruts del universo */
+proc sql;
+  create table work.seguros_perim2 as
+  select s.*
+  from work.seguros_perim s
+  inner join work.ruts_base r
+    on s.RUT_JOIN = r.RUT_JOIN;
+quit;
+
+/* join base + seguros por RUT + POLIZA + MES, luego dedup por distancia */
+proc sql;
+  create table work.base_seguros_match as
+  select b.*,
+         s.MEDIO_PAGO     as MEDIO_PAGO_SEG length=100,
+         s.CANAL_VENTA    as CANAL_VENTA_SEG length=4000,
+         s.SUCURSAL_VENTA as SUCURSAL_VENTA_SEG length=100,
+         s.ESTADO         as ESTADO_SEGURO length=50,
+         s.DES_PRODUCTO   as DES_PRODUCTO_SEG length=255,
+         s.FRECUENCIA     as FRECUENCIA_PAGO length=100,
+         s.PRIMA          as PRIMA_SEG,
+         s.ID_SEGURO      as ID_SEGURO_SEG length=50,
+         s.FEC_VIG_EXACT  as FEC_VIGENCIA_EXACT format=ddmmyy10.,
+         abs(s.FEC_VIG_EXACT - b.FEC_OTORGAMIENTO_FINAL) as DIST_FECHA
+  from work.base_enrich b
+  left join work.seguros_perim2 s
+    on b.RUT_JOIN        = s.RUT_JOIN
+   and b.POLIZA_JOIN     = s.POLIZA_JOIN
+   and b.MES_OTORGAMIENTO= s.MES_VIGENCIA;
+quit;
+
+/* dedup: quedarse con el match mas cercano (por KEY_CLAIM) */
+proc sort data=work.base_seguros_match;
+  by KEY_CLAIM DIST_FECHA;
+run;
+
+proc sort data=work.base_seguros_match nodupkey;
+  by KEY_CLAIM;
+run;
+
+/*=============================================================================*
+* 5) CONTEOS DE SEGUROS (TODOS los productos) - perfil de contratación
+*=============================================================================*/
+data work.seguros_all_small;
+  set clsncpop.dw_seguros(keep=RUT_TITULAR ID_SEGURO FEC_VIGENCIA ESTADO);
+  RUT_JOIN     = norm_rut(RUT_TITULAR);
+  FEC_VIG_EXACT= datepart(FEC_VIGENCIA);
+  format FEC_VIG_EXACT ddmmyy10.;
+run;
+
+proc sql;
+  create table work.seguros_all_small2 as
+  select s.*
+  from work.seguros_all_small s
+  inner join work.ruts_base r
+    on s.RUT_JOIN = r.RUT_JOIN;
+quit;
+
+/* 5.1 N seguros en 12M previos a ocurrencia (por siniestro) */
+proc sql;
+  create table work.count_seg_ocurr as
+  select b.KEY_CLAIM,
+         b.RUT_JOIN,
+         count(distinct s.ID_SEGURO) as N_SEG_12M_PRE_OCURR
+  from work.base_enrich b
+  left join work.seguros_all_small2 s
+    on b.RUT_JOIN = s.RUT_JOIN
+   and s.FEC_VIG_EXACT between intnx('day', b.FEC_OCURRENCIA_FINAL, -365, 's')
+                          and b.FEC_OCURRENCIA_FINAL
+  group by b.KEY_CLAIM, b.RUT_JOIN;
+quit;
+
+/* 5.2 N seguros en 12M previos a fecha referencia (dic-2025) (por RUT) */
+proc sql;
+  create table work.count_seg_ref as
+  select RUT_JOIN,
+         count(distinct ID_SEGURO) as N_SEG_12M_DIC2025
+  from work.seguros_all_small2
+  where FEC_VIG_EXACT between intnx('day', &Fec_Ref, -365, 's') and &Fec_Ref
+  group by RUT_JOIN;
+quit;
+
+/* 5.3 N seguros vigentes hoy (según ESTADO) (por RUT) */
+proc sql;
+  create table work.count_seg_vig as
+  select RUT_JOIN,
+         count(distinct ID_SEGURO) as N_SEG_VIGENTES
+  from work.seguros_all_small2
+  where upcase(strip(ESTADO)) = 'VIGENTE'
+  group by RUT_JOIN;
+quit;
+
+/*=============================================================================*
+* 6) SINIESTROS EN OTRAS COBERTURAS / POLIZAS (DW_SINIESTROS sin filtro perimetro)
+*=============================================================================*/
+data work.dw_siniestros_small;
+  set clsncpop.dw_siniestros(keep=RUT_ASEGURADO NUMERO_SINIESTRO POLIZA_MADRE FEC_OCURRENCIA);
+  RUT_JOIN = norm_rut(RUT_ASEGURADO);
+  POLIZA_JOIN = strip(POLIZA_MADRE);
+  FEC_OCUR = FEC_OCURRENCIA;
+  format FEC_OCUR ddmmyy10.;
+run;
+
+proc sql;
+  create table work.dw_siniestros_small2 as
+  select s.*
+  from work.dw_siniestros_small s
+  inner join work.ruts_base r
+    on s.RUT_JOIN = r.RUT_JOIN
+  where s.FEC_OCUR >= '01jan2020'd
+    and strip(s.POLIZA_JOIN) not in (&FILTRO_BC_AUX);
+quit;
+
+proc sql;
+  create table work.sin_otras_cob as
+  select RUT_JOIN,
+         count(distinct NUMERO_SINIESTRO) as N_SIN_OTRAS_COB,
+         count(distinct POLIZA_JOIN)      as N_POLIZAS_SINIESTRADAS
+  from work.dw_siniestros_small2
+  group by RUT_JOIN;
+quit;
+
+/*=============================================================================*
+* 7) CONSOLIDACION (base + dire + giro + conteos + siniestralidad cruzada)
+*=============================================================================*/
+proc sql;
+  create table work.base_enriquecida as
+  select
+    b.*,
+
+    /* geografia */
+    d.COMUNA_PER,
+    d.DIRECCION_PER,
+    d.CALLE_PER,
+    d.NUMERO_DIR,
+    d.TIPO_PROPIEDAD_PER,
+    d.NUMERO_PROPIEDAD_PER,
+    d.RESTO_DIRECCION_PER,
+
+    /* giro */
+    g.COD_GIRO_PER,
+    g.GLOSA_GIRO_PER,
+
+    /* conteos seguros */
+    coalesce(c1.N_SEG_12M_PRE_OCURR,0) as N_SEG_12M_PRE_OCURR,
+    coalesce(c2.N_SEG_12M_DIC2025,0)   as N_SEG_12M_DIC2025,
+    coalesce(c3.N_SEG_VIGENTES,0)     as N_SEG_VIGENTES,
+
+    /* siniestralidad cruzada */
+    coalesce(sx.N_SIN_OTRAS_COB,0)        as N_SIN_OTRAS_COB,
+    coalesce(sx.N_POLIZAS_SINIESTRADAS,0) as N_POLIZAS_SINIESTRADAS
+
+  from work.base_seguros_match b
+  left join work.per_dire_last   d on b.RUT_JOIN = d.RUT_JOIN
+  left join work.per_giro_last   g on b.RUT_JOIN = g.RUT_JOIN
+  left join work.count_seg_ocurr c1 on b.KEY_CLAIM = c1.KEY_CLAIM
+  left join work.count_seg_ref   c2 on b.RUT_JOIN  = c2.RUT_JOIN
+  left join work.count_seg_vig   c3 on b.RUT_JOIN  = c3.RUT_JOIN
+  left join work.sin_otras_cob   sx on b.RUT_JOIN  = sx.RUT_JOIN
+  ;
+quit;
+
+/*=============================================================================*
+* 8) VARIABLES DERIVADAS (analíticas para EDA + modelo)
+*=============================================================================*/
+data work.base_enriquecida;
+  set work.base_enriquecida;
+
+  /*--------------------------*
+  * 8.1 Edad al siniestro
+  *    (usa la mejor fecha disponible si existe; si no, queda missing)
+  *--------------------------*/
+  length DOB 8;
+  format DOB ddmmyy10.;
+
+  /* candidates (si no existen, SAS los crea missing y no rompe) */
+  DOB = .;
+  if not missing(ASEGURADOFECNAC) then DOB = datepart(ASEGURADOFECNAC);
+  else if not missing(MIN_of_Fec_Nacimiento) then DOB = MIN_of_Fec_Nacimiento;
+  else if not missing(Fec_Nacimiento) then DOB = Fec_Nacimiento;
+
+  if not missing(DOB) and not missing(FEC_OCURRENCIA_FINAL) then
+    EDAD_AL_SINIESTRO = floor(yrdif(DOB, FEC_OCURRENCIA_FINAL, 'AGE'));
+  else EDAD_AL_SINIESTRO = .;
+
+  /*--------------------------*
+  * 8.2 Dia de semana / fin de semana
+  *--------------------------*/
+  if not missing(FEC_OCURRENCIA_FINAL) then do;
+    DIA_SEMANA_OCURR = weekday(FEC_OCURRENCIA_FINAL); /* 1=Dom, 2=Lun, ... 7=Sab */
+    FLAG_FIN_SEMANA  = (DIA_SEMANA_OCURR in (1,7));
+  end;
+  else do;
+    DIA_SEMANA_OCURR = .;
+    FLAG_FIN_SEMANA  = .;
+  end;
+
+  /*--------------------------*
+  * 8.3 Periodo (mes) ocurrencia
+  *--------------------------*/
+  if not missing(FEC_OCURRENCIA_FINAL) then do;
+    PERIODO_OCURRENCIA = intnx('month', FEC_OCURRENCIA_FINAL, 0, 'b');
+    ANIO_OCURRENCIA    = year(FEC_OCURRENCIA_FINAL);
+    MES_OCURRENCIA     = month(FEC_OCURRENCIA_FINAL);
+    format PERIODO_OCURRENCIA yymmn6.;
+  end;
+
+  /*--------------------------*
+  * 8.4 Tramos DIF_VIGENCIA
+  *--------------------------*/
+  length TRAMO_DIF_VIG $25;
+  if not missing(DIF_VIGENCIA) then do;
+    if DIF_VIGENCIA < 31 then TRAMO_DIF_VIG = '1. <31';
+    else if DIF_VIGENCIA < 60 then TRAMO_DIF_VIG = '2. 31-59';
+    else if DIF_VIGENCIA < 90 then TRAMO_DIF_VIG = '3. 60-89';
+    else if DIF_VIGENCIA < 180 then TRAMO_DIF_VIG = '4. 90-179';
+    else if DIF_VIGENCIA < 365 then TRAMO_DIF_VIG = '5. 180-364';
+    else TRAMO_DIF_VIG = '6. 365+';
+  end;
+  else TRAMO_DIF_VIG = '';
+
+  /*--------------------------*
+  * 8.5 Tramos USO_TOPE
+  *--------------------------*/
+  length TRAMO_USO_TOPE $25;
+  if not missing(USO_TOPE) then do;
+    if USO_TOPE < 0.5 then TRAMO_USO_TOPE = '1. <50%';
+    else if USO_TOPE < 0.7 then TRAMO_USO_TOPE = '2. 50-69%';
+    else if USO_TOPE < 0.8 then TRAMO_USO_TOPE = '3. 70-79%';
+    else if USO_TOPE < 0.9 then TRAMO_USO_TOPE = '4. 80-89%';
+    else if USO_TOPE < 1.0 then TRAMO_USO_TOPE = '5. 90-99%';
+    else TRAMO_USO_TOPE = '6. 100%+';
+  end;
+  else TRAMO_USO_TOPE = '';
+
+  /*--------------------------*
+  * 8.6 Flags evasión umbrales (y compuesto)
+  *--------------------------*/
+  FLAG_EVASION_DIF31_45   = (31 <= DIF_VIGENCIA <= 45);
+  FLAG_EVASION_TOPE_75_80 = (0.75 <= USO_TOPE < 0.8);
+  FLAG_EVASION_AMBOS      = (FLAG_EVASION_DIF31_45=1 and FLAG_EVASION_TOPE_75_80=1);
+
+  /*--------------------------*
+  * 8.7 Quiebre post agosto 2024
+  *--------------------------*/
+  if not missing(FEC_OCURRENCIA_FINAL) then
+    FLAG_POST_AGO2024 = (FEC_OCURRENCIA_FINAL >= '01aug2024'd);
+  else FLAG_POST_AGO2024 = .;
+
+  /*--------------------------*
+  * 8.8 Tramo edad
+  *--------------------------*/
+  length TRAMO_EDAD $12;
+  if not missing(EDAD_AL_SINIESTRO) then do;
+    if EDAD_AL_SINIESTRO < 25 then TRAMO_EDAD = '1. <25';
+    else if EDAD_AL_SINIESTRO < 35 then TRAMO_EDAD = '2. 25-34';
+    else if EDAD_AL_SINIESTRO < 45 then TRAMO_EDAD = '3. 35-44';
+    else if EDAD_AL_SINIESTRO < 55 then TRAMO_EDAD = '4. 45-54';
+    else if EDAD_AL_SINIESTRO < 65 then TRAMO_EDAD = '5. 55-64';
+    else TRAMO_EDAD = '6. 65+';
+  end;
+  else TRAMO_EDAD = '';
+
+  /*--------------------------*
+  * 8.9 Flags compuestos (perfil)
+  *--------------------------*/
+  FLAG_MULTI_SEGURO  = (N_SEG_12M_PRE_OCURR >= 3);
+  FLAG_SIN_CRUZADA   = (N_SIN_OTRAS_COB > 0);
+  FLAG_MULTI_Y_CRUZ  = (FLAG_MULTI_SEGURO=1 and FLAG_SIN_CRUZADA=1);
+
+run;
+
+/*=============================================================================*
+* 9) DIAGNOSTICO RAPIDO DE CALIDAD DE CRUCES
+*=============================================================================*/
+title "=== Diagnostico: Tasa de match de variables enriquecidas ===";
+proc sql;
+  select
+    count(*) as TOTAL_REGISTROS,
+
+    sum(case when COMUNA_PER ne '' then 1 else 0 end) as N_CON_COMUNA,
+    calculated N_CON_COMUNA / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_COMUNA,
+
+    sum(case when CANAL_VENTA_SEG ne '' then 1 else 0 end) as N_CON_CANAL,
+    calculated N_CON_CANAL / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_CANAL,
+
+    sum(case when SUCURSAL_VENTA_SEG ne '' then 1 else 0 end) as N_CON_SUCURSAL,
+    calculated N_CON_SUCURSAL / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_SUCURSAL,
+
+    sum(case when MEDIO_PAGO_SEG ne '' then 1 else 0 end) as N_CON_MEDIO_PAGO,
+    calculated N_CON_MEDIO_PAGO / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_MEDIO_PAGO,
+
+    sum(case when GLOSA_GIRO_PER ne '' then 1 else 0 end) as N_CON_GIRO,
+    calculated N_CON_GIRO / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_GIRO,
+
+    sum(case when N_SEG_12M_PRE_OCURR > 0 then 1 else 0 end) as N_CON_SEGUROS_PRE,
+    calculated N_CON_SEGUROS_PRE / calculated TOTAL_REGISTROS * 100 format=5.1 as PCT_SEGUROS_PRE
+
+  from work.base_enriquecida;
+quit;
+title;
+
+/*=============================================================================*
+* 10) OUTPUTS: guardar tabla + export Excel
+*=============================================================================*/
+data Salidas.ROBO_ENRIQUECIDA;
+  set work.base_enriquecida;
+run;
+
+proc export
+  data=work.base_enriquecida
+  dbms=xlsx
+  outfile="/sasdata/Proyectos/Estudios/ROBO_ENRIQUECIDA_DIC2025.xlsx"
+  replace;
+  sheet="BASE_ENRIQUECIDA";
+run;
