@@ -1,0 +1,66 @@
+/*========================================================*
+* Crea WORK.POLIZAS_PERIM desde &FILTRO_BC_AUX (robusto)
+*========================================================*/
+%macro ensure_polizas_perim;
+
+  /* Si ya existe, no hacer nada */
+  %if %sysfunc(exist(work.polizas_perim)) %then %return;
+
+  /* Caso A: viene del pipeline del colega */
+  %if %symexist(FILTRO_BC_AUX) %then %do;
+    data work.polizas_perim;
+      length POLIZA_JOIN $50;
+      do _i_=1 by 1 while(scan(symget('FILTRO_BC_AUX'), _i_, ',') ne '');
+        POLIZA_JOIN = compress(scan(symget('FILTRO_BC_AUX'), _i_, ','), "'");
+        POLIZA_JOIN = strip(POLIZA_JOIN);
+        if POLIZA_JOIN ne '' then output;
+      end;
+      drop _i_;
+    run;
+
+    proc sort data=work.polizas_perim nodupkey;
+      by POLIZA_JOIN;
+    run;
+
+    %put NOTE: WORK.POLIZAS_PERIM creada desde &FILTRO_BC_AUX;
+    %return;
+  %end;
+
+  /* Caso B: no existe macro, pero existe WORK.FILTRO_BC */
+  %if %sysfunc(exist(work.filtro_bc)) %then %do;
+    proc sql;
+      create table work.polizas_perim as
+      select distinct strip(put(POLIZA, best12.)) as POLIZA_JOIN length=50
+      from work.filtro_bc
+      where POLIZA is not null;
+    quit;
+
+    proc sort data=work.polizas_perim nodupkey;
+      by POLIZA_JOIN;
+    run;
+
+    %put NOTE: WORK.POLIZAS_PERIM creada desde WORK.FILTRO_BC;
+    %return;
+  %end;
+
+  /* Caso C: fallback (si tampoco tienes FILTRO_BC armado) */
+  %if %sysfunc(exist(work.base_correspondencia)) %then %do;
+    proc sql;
+      create table work.polizas_perim as
+      select distinct strip(put(Poliza, best12.)) as POLIZA_JOIN length=50
+      from work.base_correspondencia
+      where upcase(strip('Familia de Riesgo'n))='FRAUDE';
+    quit;
+
+    proc sort data=work.polizas_perim nodupkey;
+      by POLIZA_JOIN;
+    run;
+
+    %put NOTE: WORK.POLIZAS_PERIM creada desde WORK.BASE_CORRESPONDENCIA;
+    %return;
+  %end;
+
+  %put ERROR: No pude crear WORK.POLIZAS_PERIM. Falta &FILTRO_BC_AUX o WORK.FILTRO_BC o WORK.BASE_CORRESPONDENCIA.;
+%mend;
+
+%ensure_polizas_perim;
