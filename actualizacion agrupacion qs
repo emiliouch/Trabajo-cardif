@@ -1,0 +1,33 @@
+data work.bc_qs_prep;
+  set work.base_correspondencia(keep=Poliza 'Agrupación_QS'n 'Fecha Clasificación'n);
+  length POLIZA_JOIN $50 AGRUPACION_QS $16;
+  POLIZA_JOIN    = strip(put(Poliza, best12.));
+  AGRUPACION_QS  = strip('Agrupación_QS'n);
+  FECHA_CLASIF   = 'Fecha Clasificación'n;
+  format FECHA_CLASIF date9.;
+  keep POLIZA_JOIN AGRUPACION_QS FECHA_CLASIF;
+run;
+
+proc sort data=work.bc_qs_prep;
+  by POLIZA_JOIN descending FECHA_CLASIF;
+run;
+
+data work.bc_qs_map;
+  set work.bc_qs_prep;
+  by POLIZA_JOIN;
+  if first.POLIZA_JOIN;   /* último registro por póliza */
+  keep POLIZA_JOIN AGRUPACION_QS;
+run;
+
+/*========================================================*
+* Join a la base final
+*========================================================*/
+proc sql;
+  create table work.base_enriquecida_2(compress=yes) as
+  select a.*,
+         b.AGRUPACION_QS
+  from work.base_enriquecida a
+  left join work.bc_qs_map b
+    on a.POLIZA_JOIN = b.POLIZA_JOIN
+  ;
+quit
