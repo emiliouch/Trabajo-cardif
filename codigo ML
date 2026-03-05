@@ -1,0 +1,573 @@
+# Fraude Robo Compra Protegida — Clusterización + Modelo (30k)
+
+## Qué vamos a lograr
+1) **Clusters** que expliquen el quiebre post AGO-2024:
+   - concentración geográfica/operativa (COMUNA, SUCURSAL, CANAL, DIRECCIÓN)
+   - patrones de evasión (cerca de 31 días / cerca de 80% tope)
+   - perfil de contratación (multi-seguro pre-siniestro)
+   - siniestralidad cruzada (otros productos)
+
+2) **Modelo predictivo**:
+   - Superv: CatBoost (target proxy `SOSPECHA_FINAL>=2`)
+   - No superv: Isolation Forest (anomalías)
+   - Interpretabilidad: SHAP
+
+> Nota: `SOSPECHA_FINAL>=2` es un **proxy** (regla), no “fraude confirmado”.
+
+
+# === 1) Imports y config ===
+import os
+import numpy as np
+import pandas as pd
+
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+RANDOM_STATE = 42
+pd.set_option("display.max_columns", 250)
+pd.set_option("display.width", 200)
+
+
+
+# === 2) Carga de datos ===
+# Recomiendo CSV si lo tienes, pero con 30k Excel anda bien.
+
+DATA_XLSX = r"./ROBO_ENRIQUECIDA_DIC2025.xlsx"
+SHEET = "BASE_ENRIQUECIDA"
+DATA_CSV = r"./ROBO_ENRIQUECIDA_DIC2025.csv"  # opcional
+
+def load_data():
+    if os.path.exists(DATA_CSV):
+        df = pd.read_csv(DATA_CSV, low_memory=False)
+        src = "csv"
+    elif os.path.exists(DATA_XLSX):
+        df = pd.read_excel(DATA_XLSX, sheet_name=SHEET)
+        src = "xlsx"
+    else:
+        raise FileNotFoundError("No encontré ni CSV ni XLSX en las rutas configuradas.")
+    return df, src
+
+df, src = load_data()
+print("Source:", src, "| rows:", len(df), "| cols:", df.shape[1])
+df.head(3)
+
+
+
+# === 3) Tipos, limpieza mínima, dedup por siniestro ===
+
+# ID único recomendado
+id_col = "KEY_CLAIM"
+if id_col not in df.columns:
+    # fallback
+    for c in ["NUMERO_FINAL_C", "NUMERO_FINAL", "ID"]:
+        if c in df.columns:
+            id_col = c
+            break
+    print("Usando id_col:", id_col)
+
+# Fechas
+for c in ["FEC_OCURRENCIA_FINAL", "FEC_OTORGAMIENTO_FINAL", "DOB", "FEC_VIGENCIA_EXACT"]:
+    if c in df.columns:
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+
+# Flags
+for c in [c for c in df.columns if c.startswith("FLAG_")]:
+    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+
+# Numéricas relevantes (si existen)
+num_candidates = [
+    "DIF_VIGENCIA","USO_TOPE","SOSPECHA_FINAL",
+    "N_SEG_12M_PRE_OCURR","N_SIN_OTRAS_COB",
+    "COUNT_OF_NUMERO_FINAL","CUENTA_SIN_FAMILIAR_AUX",
+    "MONTO_FINAL_UF"
+]
+for c in num_candidates:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+# Dedup por siniestro
+before = len(df)
+df = df.drop_duplicates(subset=[id_col]).copy()
+print("Dedup:", before, "->", len(df))
+
+# Target proxy
+df["y_rule"] = (df.get("SOSPECHA_FINAL", 0).fillna(0) >= 2).astype(int)
+
+# Quiebre
+break_date = pd.Timestamp("2024-08-01")
+df["is_post"] = (df["FEC_OCURRENCIA_FINAL"] >= break_date).astype(int)
+
+df[[id_col, "FEC_OCURRENCIA_FINAL", "is_post", "y_rule"]].head()
+
+
+
+
+# === 4) Sanity checks rápidos ===
+print("Pre:", (df["is_post"]==0).sum(), "Post:", (df["is_post"]==1).sum())
+print("y_rule rate pre:", df.loc[df.is_post==0, "y_rule"].mean().round(4),
+      "post:", df.loc[df.is_post==1, "y_rule"].mean().round(4))
+
+# Serie mensual (conteos)
+if "FEC_OCURRENCIA_FINAL" in df.columns:
+    ts = (df.assign(ym=df["FEC_OCURRENCIA_FINAL"].dt.to_period("M").astype(str))
+            .groupby("ym")[id_col].count()
+            .rename("n")
+            .reset_index())
+    ts["ym_dt"] = pd.to_datetime(ts["ym"] + "-01")
+    ts = ts.sort_values("ym_dt")
+
+    plt.figure(figsize=(10,4))
+    plt.plot(ts["ym_dt"], ts["n"])
+    plt.axvline(break_date, linestyle="--")
+    plt.title("Siniestros por mes (conteo) + quiebre AGO-2024")
+    plt.show()
+
+
+# PARTE A — Clusterización
+
+Vamos a hacer 3 cosas:
+1) Clusters “determinísticos” por llaves operativas (rápidos y muy interpretables).
+2) Clusters de red (RUT conectados por compartir atributos) — útil para “red organizada”.
+3) Clustering ML (KMeans) sobre features numéricas + encoding liviano de categóricas.
+
+
+# === A1) Clusters determinísticos (llaves) ===
+
+def norm_str(s: pd.Series) -> pd.Series:
+    return s.fillna("").astype(str).str.strip().str.upper()
+
+# Normalizar categóricas si existen
+cat_base = [
+    "COMUNA_PER","CANAL_VENTA_SEG","SUCURSAL_VENTA_SEG","MEDIO_PAGO_SEG",
+    "DIRECCION_PER","CALLE_PER","NUMERO_DIR","GLOSA_GIRO_PER",
+    "COB","PLAN_AUX","AGRUPACION_QS"
+]
+for c in cat_base:
+    if c in df.columns:
+        df[c] = norm_str(df[c])
+
+# cluster_addr: por dirección (si existe)
+if "DIRECCION_PER" in df.columns:
+    df["cluster_addr"] = df["DIRECCION_PER"]
+elif "CALLE_PER" in df.columns and "NUMERO_DIR" in df.columns:
+    df["cluster_addr"] = df["CALLE_PER"] + "|" + df["NUMERO_DIR"]
+else:
+    df["cluster_addr"] = ""
+
+# cluster_ops: comuna|canal|sucursal (si existen)
+parts = []
+for c in ["COMUNA_PER","CANAL_VENTA_SEG","SUCURSAL_VENTA_SEG"]:
+    if c in df.columns:
+        parts.append(df[c])
+if parts:
+    key = parts[0]
+    for p in parts[1:]:
+        key = key + "|" + p
+    df["cluster_ops"] = key
+else:
+    df["cluster_ops"] = ""
+
+# cluster_pay: medio pago (+ frecuencia si existe)
+if "MEDIO_PAGO_SEG" in df.columns:
+    if "FRECUENCIA_PAGO" in df.columns:
+        df["FRECUENCIA_PAGO"] = norm_str(df["FRECUENCIA_PAGO"])
+        df["cluster_pay"] = df["MEDIO_PAGO_SEG"] + "|" + df["FRECUENCIA_PAGO"]
+    else:
+        df["cluster_pay"] = df["MEDIO_PAGO_SEG"]
+else:
+    df["cluster_pay"] = ""
+
+df[["cluster_addr","cluster_ops","cluster_pay"]].head()
+
+
+# === A1.1) Ranking de clusters que explotan post-AGO2024 ===
+
+def cluster_summary(df, cluster_col, min_size=20, top_n=25):
+    tmp = df[df[cluster_col].ne("")].copy()
+    if tmp.empty:
+        return pd.DataFrame()
+
+    overall_post_rate = tmp["is_post"].mean()
+
+    g = (tmp.groupby(cluster_col, dropna=False)
+           .agg(n_total=(id_col,"count"),
+                n_post=("is_post","sum"),
+                n_pre=("is_post", lambda x: (x==0).sum()),
+                y_rate=("y_rule","mean"),
+                post_rate=("is_post","mean"),
+                evasion=("FLAG_EVASION_AMBOS","mean") if "FLAG_EVASION_AMBOS" in tmp.columns else ("y_rule","mean"),
+                multiseg=("FLAG_MULTI_SEGURO","mean") if "FLAG_MULTI_SEGURO" in tmp.columns else ("y_rule","mean"))
+           .reset_index())
+
+    g = g[g["n_total"] >= min_size].copy()
+    g["lift_post_vs_overall"] = g["post_rate"] / (overall_post_rate if overall_post_rate>0 else 1e-9)
+    g = g.sort_values(["n_post","lift_post_vs_overall"], ascending=False).head(top_n)
+    return g
+
+for col in ["cluster_addr","cluster_ops","cluster_pay"]:
+    print("\n====", col, "====")
+    display(cluster_summary(df, col, min_size=20, top_n=20))
+
+
+### Cómo leer esto (muy literal)
+- `n_post` alto = ese cluster aporta muchos casos post quiebre.
+- `lift_post_vs_overall` > 1 = ese cluster está **más cargado a post** que el promedio.
+- `y_rate` alto = coincide con tu proxy de fraude.
+- `evasion` alto = sugiere que ese cluster está “jugando” con umbrales.
+
+
+
+# === A2) Clusters de red (requiere networkx). Si no lo tienes, te lo salta. ===
+try:
+    import networkx as nx
+
+    rut_col = "RUT_JOIN" if "RUT_JOIN" in df.columns else None
+    if rut_col is None:
+        raise ValueError("No existe RUT_JOIN en el dataset.")
+
+    # atributos para conectar (ajusta: mientras más, más conexiones)
+    attr_cols = [c for c in ["cluster_addr","COMUNA_PER","CANAL_VENTA_SEG","SUCURSAL_VENTA_SEG","MEDIO_PAGO_SEG","GLOSA_GIRO_PER"]
+                 if c in df.columns]
+
+    G = nx.Graph()
+
+    # limitar a atributos “informativos” (evita conectar a todo el mundo por valores gigantes)
+    # ejemplo: excluir categorías con freq > 20% del dataset
+    max_freq = 0.20
+    allowed_values = {}
+    for c in attr_cols:
+        vc = df[c].value_counts(dropna=False)
+        allowed = set(vc[vc/len(df) <= max_freq].index.tolist())
+        allowed_values[c] = allowed
+
+    # construir grafo
+    for _, row in df[[rut_col] + attr_cols].iterrows():
+        rut = row[rut_col]
+        if not rut or rut == "": 
+            continue
+        rut_node = f"RUT:{rut}"
+        G.add_node(rut_node, kind="rut")
+
+        for c in attr_cols:
+            val = row[c]
+            if not val or val == "":
+                continue
+            if val not in allowed_values[c]:
+                continue
+            attr_node = f"{c}:{val}"
+            G.add_node(attr_node, kind="attr", attr=c)
+            G.add_edge(rut_node, attr_node)
+
+    # componentes conectados sobre subgrafo de ruts
+    # (componentes del grafo completo; luego extraemos ruts)
+    comps = list(nx.connected_components(G))
+    rut_components = []
+    for comp in comps:
+        ruts = [n for n in comp if n.startswith("RUT:")]
+        if len(ruts) >= 3:  # umbral mínimo
+            rut_components.append(ruts)
+
+    # asignar id de componente a cada RUT
+    rut_to_comp = {}
+    for i, ruts in enumerate(rut_components):
+        for r in ruts:
+            rut_to_comp[r.replace("RUT:","")] = i
+
+    df["cluster_net"] = df[rut_col].map(rut_to_comp).fillna(-1).astype(int)
+
+    net_stats = (df[df["cluster_net"]!=-1]
+                 .groupby("cluster_net")
+                 .agg(n=(id_col,"count"),
+                      n_ruts=(rut_col,"nunique"),
+                      post_rate=("is_post","mean"),
+                      y_rate=("y_rule","mean"),
+                      evasion=("FLAG_EVASION_AMBOS","mean") if "FLAG_EVASION_AMBOS" in df.columns else ("y_rule","mean"))
+                 .reset_index()
+                 .sort_values(["n","post_rate"], ascending=False)
+                 .head(20))
+
+    display(net_stats)
+
+except Exception as e:
+    print("No se pudo ejecutar cluster de red (networkx no disponible o error):", str(e))
+
+
+
+### Lectura de cluster_net
+- `n_ruts` grande y `post_rate` alto: red conectada por atributos que explota post quiebre.
+- Esto es MUY útil para decir “hay estructura de red” aunque no tengas parentesco.
+
+  
+
+
+# === A3) KMeans clustering (sklearn) ===
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+# Features numéricas
+numeric_features = [c for c in [
+    "DIF_VIGENCIA","USO_TOPE","MONTO_FINAL_UF",
+    "COUNT_OF_NUMERO_FINAL","CUENTA_SIN_FAMILIAR_AUX",
+    "N_SEG_12M_PRE_OCURR","N_SIN_OTRAS_COB",
+    "FLAG_FIN_SEMANA","EDAD_AL_SINIESTRO"
+] if c in df.columns]
+
+# Categóricas: usamos frequency encoding para no explotar dimensionalidad
+cat_features = [c for c in [
+    "COMUNA_PER","CANAL_VENTA_SEG","SUCURSAL_VENTA_SEG","MEDIO_PAGO_SEG",
+    "COB","PLAN_AUX","AGRUPACION_QS","GLOSA_GIRO_PER",
+    "TRAMO_DIF_VIG","TRAMO_USO_TOPE","TRAMO_EDAD"
+] if c in df.columns]
+
+X_num = df[numeric_features].copy() if numeric_features else pd.DataFrame(index=df.index)
+X_num = X_num.replace([np.inf, -np.inf], np.nan)
+for c in X_num.columns:
+    X_num[c] = X_num[c].fillna(X_num[c].median())
+
+X_cat = pd.DataFrame(index=df.index)
+for c in cat_features:
+    vc = df[c].fillna("").value_counts(dropna=False)
+    X_cat[c + "__freq"] = df[c].fillna("").map(vc) / len(df)
+
+X = pd.concat([X_num, X_cat], axis=1)
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+ks = [3,4,5,6,8,10]
+scores = []
+for k in ks:
+    km = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init="auto")
+    labels = km.fit_predict(X_scaled)
+    scores.append((k, silhouette_score(X_scaled, labels)))
+
+scores_df = pd.DataFrame(scores, columns=["k","silhouette"]).sort_values("silhouette", ascending=False)
+display(scores_df)
+
+best_k = int(scores_df.iloc[0]["k"])
+km = KMeans(n_clusters=best_k, random_state=RANDOM_STATE, n_init="auto")
+df["cluster_ml"] = km.fit_predict(X_scaled)
+
+(df["cluster_ml"].value_counts().head(), best_k)
+
+
+
+# Perfil de clusters ML
+cluster_stats = df.groupby("cluster_ml").agg(
+    n=(id_col,"count"),
+    post_rate=("is_post","mean"),
+    y_rate=("y_rule","mean"),
+    evasion=("FLAG_EVASION_AMBOS","mean") if "FLAG_EVASION_AMBOS" in df.columns else ("y_rule","mean"),
+    multi=("FLAG_MULTI_SEGURO","mean") if "FLAG_MULTI_SEGURO" in df.columns else ("y_rule","mean"),
+    cruz=("FLAG_SIN_CRUZADA","mean") if "FLAG_SIN_CRUZADA" in df.columns else ("y_rule","mean"),
+).reset_index().sort_values("n", ascending=False)
+
+display(cluster_stats)
+
+# Perfil de clusters ML
+cluster_stats = df.groupby("cluster_ml").agg(
+    n=(id_col,"count"),
+    post_rate=("is_post","mean"),
+    y_rate=("y_rule","mean"),
+    evasion=("FLAG_EVASION_AMBOS","mean") if "FLAG_EVASION_AMBOS" in df.columns else ("y_rule","mean"),
+    multi=("FLAG_MULTI_SEGURO","mean") if "FLAG_MULTI_SEGURO" in df.columns else ("y_rule","mean"),
+    cruz=("FLAG_SIN_CRUZADA","mean") if "FLAG_SIN_CRUZADA" in df.columns else ("y_rule","mean"),
+).reset_index().sort_values("n", ascending=False)
+
+display(cluster_stats)
+
+
+
+### Cómo usar cluster_ml en el informe
+- “Cluster 2 concentra el X% de los post-ago2024 y tiene y_rate alto + evasión alta”.
+- Es una segmentación complementaria: no reemplaza los clusters determinísticos, los apoya.
+
+
+# PARTE B — Modelo predictivo (CatBoost + Isolation Forest)
+
+## Split temporal (importante)
+Entrenamos en **PRE** (antes del quiebre) y testeamos en **POST**.
+Eso te dice si el patrón cambió.
+
+
+# === B1) Split temporal ===
+train = df[df["is_post"]==0].copy()
+test  = df[df["is_post"]==1].copy()
+
+print("Train:", len(train), "Test:", len(test))
+print("y_rule pre:", train["y_rule"].mean().round(4), "post:", test["y_rule"].mean().round(4))
+
+
+
+# === B2) Features ===
+num_feats = [c for c in [
+    "DIF_VIGENCIA","USO_TOPE","MONTO_FINAL_UF",
+    "COUNT_OF_NUMERO_FINAL","CUENTA_SIN_FAMILIAR_AUX",
+    "N_SEG_12M_PRE_OCURR","N_SIN_OTRAS_COB",
+    "EDAD_AL_SINIESTRO"
+] if c in df.columns]
+
+bin_feats = [c for c in [
+    "FLAG_FIN_SEMANA","FLAG_MULTI_SEGURO","FLAG_SIN_CRUZADA",
+    "FLAG_EVASION_DIF31_45","FLAG_EVASION_TOPE_75_80"
+] if c in df.columns]
+
+cat_feats = [c for c in [
+    "COMUNA_PER","CANAL_VENTA_SEG","SUCURSAL_VENTA_SEG","MEDIO_PAGO_SEG",
+    "COB","PLAN_AUX","AGRUPACION_QS","GLOSA_GIRO_PER",
+    "TRAMO_DIF_VIG","TRAMO_USO_TOPE","TRAMO_EDAD"
+] if c in df.columns]
+
+print("num:", num_feats)
+print("bin:", bin_feats)
+print("cat:", cat_feats)
+
+
+
+from catboost import CatBoostClassifier, Pool
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+# Dataframes X/y
+feature_cols = num_feats + bin_feats + cat_feats
+
+X_train = train[feature_cols].copy()
+X_test  = test[feature_cols].copy()
+y_train = train["y_rule"].astype(int)
+y_test  = test["y_rule"].astype(int)
+
+# CatBoost necesita indices de columnas categóricas
+cat_indices = [X_train.columns.get_loc(c) for c in cat_feats]
+
+train_pool = Pool(X_train, y_train, cat_features=cat_indices)
+test_pool  = Pool(X_test,  y_test,  cat_features=cat_indices)
+
+model = CatBoostClassifier(
+    depth=6,
+    learning_rate=0.05,
+    iterations=2000,
+    loss_function="Logloss",
+    eval_metric="AUC",
+    random_seed=RANDOM_STATE,
+    verbose=200,
+    od_type="Iter",
+    od_wait=200
+)
+
+model.fit(train_pool, eval_set=test_pool)
+
+p_train = model.predict_proba(train_pool)[:,1]
+p_test  = model.predict_proba(test_pool)[:,1]
+
+print("AUC train:", roc_auc_score(y_train, p_train).round(4),
+      "AUC test:", roc_auc_score(y_test, p_test).round(4))
+print("PR-AUC train:", average_precision_score(y_train, p_train).round(4),
+      "PR-AUC test:", average_precision_score(y_test, p_test).round(4))
+
+train["risk_cb"] = p_train
+test["risk_cb"]  = p_test
+
+
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest
+
+# Para IsolationForest usamos SOLO numéricas y bins (las categóricas no entran directo)
+iso_feats = num_feats + bin_feats
+Xtr_iso = train[iso_feats].copy()
+Xte_iso = test[iso_feats].copy()
+
+for c in iso_feats:
+    Xtr_iso[c] = pd.to_numeric(Xtr_iso[c], errors="coerce")
+    Xte_iso[c] = pd.to_numeric(Xte_iso[c], errors="coerce")
+    Xtr_iso[c] = Xtr_iso[c].fillna(Xtr_iso[c].median())
+    Xte_iso[c] = Xte_iso[c].fillna(Xtr_iso[c].median())
+
+scaler = StandardScaler()
+Xtr_s = scaler.fit_transform(Xtr_iso)
+Xte_s = scaler.transform(Xte_iso)
+
+iso = IsolationForest(
+    n_estimators=400,
+    contamination="auto",
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+iso.fit(Xtr_s)
+
+train["risk_iso"] = -iso.score_samples(Xtr_s)
+test["risk_iso"]  = -iso.score_samples(Xte_s)
+
+train["risk_iso"].describe(), test["risk_iso"].describe()
+
+
+def precision_at_k(y_true: pd.Series, scores: pd.Series, k: int) -> float:
+    k = min(k, len(scores))
+    idx = np.argsort(scores.values)[::-1][:k]
+    return float(y_true.iloc[idx].mean())
+
+for k in [100, 200, 500, 1000, 2000]:
+    if k <= len(test):
+        print(f"Precision@{k} CatBoost:", precision_at_k(test["y_rule"], test["risk_cb"], k))
+
+
+  import shap
+
+# SHAP en una muestra para que sea rápido
+sample = test.sample(min(2000, len(test)), random_state=RANDOM_STATE)
+sample_pool = Pool(sample[feature_cols], cat_features=cat_indices)
+
+# shap values (CatBoost)
+shap_vals = model.get_feature_importance(sample_pool, type="ShapValues")
+# shap_vals es (n, m+1) donde el último es base value
+shap_values = shap_vals[:, :-1]
+base_value = shap_vals[:, -1].mean()
+
+explainer = shap.Explainer(model)
+# shap.Explainer puede tardar; alternativa: usar shap_values ya calculados.
+shap.summary_plot(shap_values, sample[feature_cols], show=False)
+plt.title("SHAP summary (CatBoost) — muestra post-AGO2024")
+plt.show()
+
+
+cols_out = [c for c in [
+    id_col, "FEC_OCURRENCIA_FINAL", "RUT_JOIN", "POLIZA_JOIN",
+    "COMUNA_PER","CANAL_VENTA_SEG","SUCURSAL_VENTA_SEG","MEDIO_PAGO_SEG",
+    "DIF_VIGENCIA","USO_TOPE","MONTO_FINAL_UF",
+    "N_SEG_12M_PRE_OCURR","N_SIN_OTRAS_COB",
+    "FLAG_EVASION_AMBOS","FLAG_MULTI_SEGURO","FLAG_SIN_CRUZADA",
+    "y_rule","risk_cb","risk_iso"
+] if c in test.columns]
+
+top = test.sort_values("risk_cb", ascending=False).head(500)[cols_out]
+top.to_csv("top500_post_ago2024_catboost.csv", index=False)
+top.head(20)
+
+
+
+# Qué entregas como resultado del notebook (para el informe)
+
+## 1) Clusters
+- Top clusters determinísticos (dirección / comuna-canal-sucursal / pago) con:
+  - n_post alto
+  - lift_post_vs_overall alto
+  - y_rate (proxy) alto
+
+- Si corre networkx:
+  - clusters de red (cluster_net) con n_ruts alto + post_rate alto
+
+- Cluster ML (cluster_ml):
+  - tabla cluster_stats con n, post_rate, y_rate, evasion, multi, cruz
+
+## 2) Modelo
+- CatBoost entrenado en pre, evaluado en post:
+  - AUC/PR-AUC y Precision@K
+- SHAP summary: variables que empujan el score
+- Export de top casos post para revisión
+
+
+
+
+
+
+
