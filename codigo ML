@@ -29,7 +29,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from sklearn.ensemble import IsolationForest, HistGradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.ensemble import HistGradientBoostingClassifier, IsolationForest
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
@@ -301,30 +303,55 @@ Por ello, se definieron cuatro clusters operativos compuestos: comuna + canal, c
 
 
 
-## Modelo supervisado: CatBoost
-
-Se utiliza CatBoost como modelo principal porque:
-
-- maneja categóricas nativamente
-- tolera missing values
-- funciona muy bien en datasets tabulares medianos
-- permite interpretabilidad con SHAP
+# ============================================================
+# MODELAJE DEL QUIEBRE
+# Objetivo:
+# responder qué variables explican el período post AGO-2024
+# y cuáles agregan señal más allá de lo que ya sabíamos
+# ============================================================
 
 
+# ------------------------------------------------------------
+# Utilidades
+# ------------------------------------------------------------
+def precision_at_k(y_true, scores, k):
+    idx = np.argsort(scores)[::-1][:k]
+    return y_true.iloc[idx].mean()
 
+def zscore(s):
+    return (s - s.mean()) / s.std()
 
+def safe_upper(s):
+    return s.fillna("").astype(str).str.strip().str.upper()
 
+# ------------------------------------------------------------
+# 1) TARGET DEL QUIEBRE
+# ------------------------------------------------------------
+# is_post ya fue creado antes:
+# df["is_post"] = (df["FEC_OCURRENCIA_FINAL"] >= "2024-08-01").astype(int)
 
+y_break = df["is_post"].astype(int)
 
-num_features = [c for c in [
+print("Proporción post AGO-2024:", round(y_break.mean(), 4))
+print("Pre:", int((y_break == 0).sum()), "Post:", int((y_break == 1).sum()))
+
+# ------------------------------------------------------------
+# 2) DEFINICIÓN DE FEATURES
+# ------------------------------------------------------------
+# 2.1 Variables históricas que ya conocíamos
+old_num_features = [c for c in [
     "DIF_VIGENCIA",
-    "USO_TOPE",
-    "MONTO_FINAL_UF",
     "COUNT_OF_NUMERO_FINAL",
     "CUENTA_SIN_FAMILIAR_AUX",
+    "USO_TOPE"
+] if c in df.columns]
+
+# 2.2 Variables nuevas que queremos testear para explicar el quiebre
+new_num_features = [c for c in [
+    "EDAD_AL_SINIESTRO",
     "N_SEG_12M_PRE_OCURR",
     "N_SIN_OTRAS_COB",
-    "EDAD_AL_SINIESTRO",
+    "MONTO_FINAL_UF",
     "FLAG_FIN_SEMANA",
     "FLAG_MULTI_SEGURO",
     "FLAG_SIN_CRUZADA",
@@ -332,70 +359,69 @@ num_features = [c for c in [
     "FLAG_EVASION_TOPE_75_80"
 ] if c in df.columns]
 
-cat_features = [c for c in [
+new_cat_features = [c for c in [
     "COMUNA_PER",
     "CANAL_VENTA_SEG",
     "SUCURSAL_VENTA_SEG",
     "MEDIO_PAGO_SEG",
-    "COB",
+    "FRECUENCIA_PAGO",
     "PLAN_AUX",
+    "COB",
     "AGRUPACION_QS",
     "GLOSA_GIRO_PER",
-    "TRAMO_DIF_VIG",
-    "TRAMO_USO_TOPE",
     "TRAMO_EDAD"
 ] if c in df.columns]
 
-model_features = num_features + cat_features
+# Baseline: solo lo viejo
+baseline_features = old_num_features.copy()
 
-print("Numéricas:", num_features)
-print("Categóricas:", cat_features)
+# Extendido: viejo + nuevo
+extended_features = old_num_features + new_num_features + new_cat_features
 
+print("Features baseline:", baseline_features)
+print("Features extendidas:", extended_features)
 
+# ------------------------------------------------------------
+# 3) SPLIT PARA EVALUAR MODELOS DEL QUIEBRE
+# ------------------------------------------------------------
+# Aquí NO hacemos split temporal porque el target YA es temporal (is_post).
+# Usamos train/test estratificado para evaluar capacidad discriminante.
+X_break_base = df[baseline_features].copy()
+X_break_ext = df[extended_features].copy()
 
+Xb_train, Xb_test, yb_train, yb_test = train_test_split(
+    X_break_base,
+    y_break,
+    test_size=0.3,
+    random_state=RANDOM_STATE,
+    stratify=y_break
+)
 
+Xe_train, Xe_test, ye_train, ye_test = train_test_split(
+    X_break_ext,
+    y_break,
+    test_size=0.3,
+    random_state=RANDOM_STATE,
+    stratify=y_break
+)
 
+print("Train size:", len(yb_train), "Test size:", len(yb_test))
 
-train = df[df["is_post"] == 0].copy()
-test = df[df["is_post"] == 1].copy()
-
-print("Train shape:", train.shape)
-print("Test shape :", test.shape)
-print("Target train:", round(train["y_rule"].mean(), 4))
-print("Target test :", round(test["y_rule"].mean(), 4))
-
-
-
-
-
-X_train = train[model_features].copy()
-X_test = test[model_features].copy()
-
-y_train = train["y_rule"].astype(int)
-y_test = test["y_rule"].astype(int)
-
-
-
-
-
-numeric_transformer = Pipeline(steps=[
+# ------------------------------------------------------------
+# 4) MODELO BASELINE DEL QUIEBRE (solo variables históricas)
+# ------------------------------------------------------------
+baseline_num_transformer = Pipeline(steps=[
     ("imputer", SimpleImputer(strategy="median"))
 ])
 
-categorical_transformer = Pipeline(steps=[
-    ("imputer", SimpleImputer(strategy="constant", fill_value="MISSING")),
-    ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
-])
-
-preprocessor = ColumnTransformer(
+baseline_preprocessor = ColumnTransformer(
     transformers=[
-        ("num", numeric_transformer, num_features),
-        ("cat", categorical_transformer, cat_features)
+        ("num", baseline_num_transformer, baseline_features)
     ],
     remainder="drop"
 )
 
-hgb_model = HistGradientBoostingClassifier(
+baseline_model = HistGradientBoostingClassifier(
     learning_rate=0.03,
     max_iter=500,
     max_depth=6,
@@ -404,85 +430,211 @@ hgb_model = HistGradientBoostingClassifier(
     random_state=RANDOM_STATE
 )
 
-clf = Pipeline(steps=[
-    ("preprocessor", preprocessor),
-    ("model", hgb_model)
+clf_break_base = Pipeline(steps=[
+    ("preprocessor", baseline_preprocessor),
+    ("model", baseline_model)
 ])
 
-clf.fit(X_train, y_train)
+sample_weight_base = compute_sample_weight(class_weight="balanced", y=yb_train)
+clf_break_base.fit(Xb_train, yb_train, model__sample_weight=sample_weight_base)
 
-train["risk_hgb"] = clf.predict_proba(X_train)[:, 1]
-test["risk_hgb"] = clf.predict_proba(X_test)[:, 1]
+pred_base_train = clf_break_base.predict_proba(Xb_train)[:, 1]
+pred_base_test = clf_break_base.predict_proba(Xb_test)[:, 1]
 
-print("HGB AUC train:", round(roc_auc_score(y_train, train["risk_hgb"]), 4))
-print("HGB AUC test :", round(roc_auc_score(y_test, test["risk_hgb"]), 4))
-print("HGB PR-AUC train:", round(average_precision_score(y_train, train["risk_hgb"]), 4))
-print("HGB PR-AUC test :", round(average_precision_score(y_test, test["risk_hgb"]), 4))
+print("=== MODELO BASELINE DEL QUIEBRE ===")
+print("AUC train:", round(roc_auc_score(yb_train, pred_base_train), 4))
+print("AUC test :", round(roc_auc_score(yb_test, pred_base_test), 4))
+print("PR-AUC train:", round(average_precision_score(yb_train, pred_base_train), 4))
+print("PR-AUC test :", round(average_precision_score(yb_test, pred_base_test), 4))
 
-def precision_at_k(y_true, scores, k):
-    idx = np.argsort(scores)[::-1][:k]
-    return y_true.iloc[idx].mean()
+# ------------------------------------------------------------
+# 5) MODELO EXTENDIDO DEL QUIEBRE (variables históricas + nuevas)
+# ------------------------------------------------------------
+extended_num_features = old_num_features + new_num_features
+extended_cat_features = new_cat_features.copy()
 
-for k in [50, 100, 200, 500]:
-    if k <= len(test):
-        print(f"HGB Precision@{k}: {precision_at_k(test['y_rule'], test['risk_hgb'], k):.3f}")
+num_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median"))
+])
 
+cat_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="constant", fill_value="MISSING")),
+    ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
+])
 
-perm = permutation_importance(
-    clf,
-    X_test,
-    y_test,
+extended_preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", num_transformer, extended_num_features),
+        ("cat", cat_transformer, extended_cat_features)
+    ],
+    remainder="drop"
+)
+
+extended_model = HistGradientBoostingClassifier(
+    learning_rate=0.03,
+    max_iter=500,
+    max_depth=6,
+    min_samples_leaf=30,
+    l2_regularization=1.0,
+    random_state=RANDOM_STATE
+)
+
+clf_break_ext = Pipeline(steps=[
+    ("preprocessor", extended_preprocessor),
+    ("model", extended_model)
+])
+
+sample_weight_ext = compute_sample_weight(class_weight="balanced", y=ye_train)
+clf_break_ext.fit(Xe_train, ye_train, model__sample_weight=sample_weight_ext)
+
+pred_ext_train = clf_break_ext.predict_proba(Xe_train)[:, 1]
+pred_ext_test = clf_break_ext.predict_proba(Xe_test)[:, 1]
+
+print("\n=== MODELO EXTENDIDO DEL QUIEBRE ===")
+print("AUC train:", round(roc_auc_score(ye_train, pred_ext_train), 4))
+print("AUC test :", round(roc_auc_score(ye_test, pred_ext_test), 4))
+print("PR-AUC train:", round(average_precision_score(ye_train, pred_ext_train), 4))
+print("PR-AUC test :", round(average_precision_score(ye_test, pred_ext_test), 4))
+
+# ------------------------------------------------------------
+# 6) COMPARACIÓN BASELINE vs EXTENDIDO
+# ------------------------------------------------------------
+comparison_df = pd.DataFrame({
+    "modelo": ["baseline_historico", "extendido_nuevas_vars"],
+    "auc_test": [
+        roc_auc_score(yb_test, pred_base_test),
+        roc_auc_score(ye_test, pred_ext_test)
+    ],
+    "pr_auc_test": [
+        average_precision_score(yb_test, pred_base_test),
+        average_precision_score(ye_test, pred_ext_test)
+    ]
+})
+
+print("\n=== COMPARACIÓN DE MODELOS DEL QUIEBRE ===")
+display(comparison_df)
+
+# Interpretación:
+# Si el modelo extendido mejora al baseline, las variables nuevas aportan
+# información para explicar el quiebre que no estaba en las variables históricas.
+
+# ------------------------------------------------------------
+# 7) IMPORTANCIA DE VARIABLES EN EL MODELO EXTENDIDO
+# ------------------------------------------------------------
+perm_break = permutation_importance(
+    clf_break_ext,
+    Xe_test,
+    ye_test,
     n_repeats=10,
     random_state=RANDOM_STATE,
     scoring="average_precision"
 )
 
-feature_names = model_features
-
-perm_df = pd.DataFrame({
-    "feature": feature_names,
-    "importance_mean": perm.importances_mean,
-    "importance_std": perm.importances_std
+perm_break_df = pd.DataFrame({
+    "feature": extended_features,
+    "importance_mean": perm_break.importances_mean,
+    "importance_std": perm_break.importances_std
 }).sort_values("importance_mean", ascending=False)
 
-perm_df.head(20)
+print("\n=== IMPORTANCIA DE VARIABLES - MODELO DEL QUIEBRE ===")
+display(perm_break_df.head(25))
 
+# Variables nuevas relevantes (las que NO pertenecen a lo histórico)
+new_signal_df = perm_break_df[
+    ~perm_break_df["feature"].isin(old_num_features)
+].copy()
 
+print("\n=== VARIABLES NUEVAS QUE MÁS EXPLICAN EL QUIEBRE ===")
+display(new_signal_df.head(20))
 
-top_perm = perm_df.head(15).copy()
-
-plt.figure(figsize=(10, 6))
-sns.barplot(data=top_perm, y="feature", x="importance_mean")
-plt.title("Permutation Importance - HistGradientBoosting")
-plt.xlabel("Importancia media")
+plt.figure(figsize=(10, 7))
+top_new_signal = new_signal_df.head(15)
+sns.barplot(data=top_new_signal, y="feature", x="importance_mean")
+plt.title("Variables nuevas más importantes para explicar el quiebre")
+plt.xlabel("Permutation importance (mean)")
 plt.ylabel("Variable")
 plt.tight_layout()
 plt.show()
 
+# ------------------------------------------------------------
+# 8) SCORE DEL QUIEBRE SOBRE TODA LA BASE
+# ------------------------------------------------------------
+# Esto nos permite analizar quiénes parecen más "post quiebre"
+# según el modelo extendido.
+df["risk_break_base"] = clf_break_base.predict_proba(X_break_base)[:, 1]
+df["risk_break_ext"] = clf_break_ext.predict_proba(X_break_ext)[:, 1]
+df["delta_break"] = df["risk_break_ext"] - df["risk_break_base"]
 
+# delta_break alto => caso cuya pertenencia al período post
+# se explica mucho mejor con variables nuevas que con las históricas.
 
+print("\nDistribución de delta_break:")
+display(df["delta_break"].describe())
 
+# ------------------------------------------------------------
+# 9) TABLAS PARA ENTENDER EL QUIEBRE POR VARIABLES NUEVAS
+# ------------------------------------------------------------
+def shift_table(data, col, min_size=20, top_n=20):
+    tmp = data[data[col].notna() & (data[col] != "")].copy()
 
+    g = tmp.groupby(col).agg(
+        n_total=(id_col, "count"),
+        n_pre=("is_post", lambda x: (x == 0).sum()),
+        n_post=("is_post", "sum"),
+        avg_break_score=("risk_break_ext", "mean"),
+        avg_delta_break=("delta_break", "mean"),
+        y_rate=("y_rule", "mean")
+    ).reset_index()
 
+    g = g[g["n_total"] >= min_size].copy()
 
-## Modelo no supervisado: Isolation Forest
+    total_pre = g["n_pre"].sum()
+    total_post = g["n_post"].sum()
 
-Este modelo se utiliza para detectar casos anómalos que no necesariamente replican el patrón histórico aprendido por el modelo supervisado.
+    g["share_pre"] = g["n_pre"] / total_pre if total_pre > 0 else np.nan
+    g["share_post"] = g["n_post"] / total_post if total_post > 0 else np.nan
+    g["lift_post_vs_pre"] = g["share_post"] / g["share_pre"].replace(0, np.nan)
 
+    return g.sort_values(["lift_post_vs_pre", "n_post"], ascending=[False, False]).head(top_n)
 
+vars_to_review = [c for c in [
+    "COMUNA_PER",
+    "CANAL_VENTA_SEG",
+    "SUCURSAL_VENTA_SEG",
+    "MEDIO_PAGO_SEG",
+    "PLAN_AUX",
+    "COB",
+    "AGRUPACION_QS",
+    "GLOSA_GIRO_PER"
+] if c in df.columns]
 
+shift_tables = {}
 
+for col in vars_to_review:
+    print(f"\n=== SHIFT TABLE: {col} ===")
+    shift_tables[col] = shift_table(df, col, min_size=20, top_n=20)
+    display(shift_tables[col])
 
+# ------------------------------------------------------------
+# 10) ISOLATION FOREST REORIENTADO AL QUIEBRE
+# ------------------------------------------------------------
+# Nuevo enfoque:
+# entrenamos SOLO en PRE-AGO-2024 para aprender el patrón histórico,
+# y luego medimos qué tan anómalos son los POST-AGO-2024.
 
-iso_features = [c for c in [
+pre_df = df[df["is_post"] == 0].copy()
+post_df = df[df["is_post"] == 1].copy()
+
+# Para IF usamos variables numéricas + encoding simple por frecuencia
+iso_num_features = [c for c in [
     "DIF_VIGENCIA",
-    "USO_TOPE",
-    "MONTO_FINAL_UF",
     "COUNT_OF_NUMERO_FINAL",
     "CUENTA_SIN_FAMILIAR_AUX",
+    "USO_TOPE",
+    "EDAD_AL_SINIESTRO",
     "N_SEG_12M_PRE_OCURR",
     "N_SIN_OTRAS_COB",
-    "EDAD_AL_SINIESTRO",
+    "MONTO_FINAL_UF",
     "FLAG_FIN_SEMANA",
     "FLAG_MULTI_SEGURO",
     "FLAG_SIN_CRUZADA",
@@ -490,81 +642,126 @@ iso_features = [c for c in [
     "FLAG_EVASION_TOPE_75_80"
 ] if c in df.columns]
 
-X_train_iso = train[iso_features].copy()
-X_test_iso = test[iso_features].copy()
+iso_cat_features = [c for c in [
+    "COMUNA_PER",
+    "CANAL_VENTA_SEG",
+    "SUCURSAL_VENTA_SEG",
+    "MEDIO_PAGO_SEG",
+    "PLAN_AUX",
+    "COB",
+    "AGRUPACION_QS",
+    "GLOSA_GIRO_PER"
+] if c in df.columns]
 
-for c in iso_features:
-    X_train_iso[c] = pd.to_numeric(X_train_iso[c], errors="coerce")
-    X_test_iso[c] = pd.to_numeric(X_test_iso[c], errors="coerce")
-    X_train_iso[c] = X_train_iso[c].fillna(X_train_iso[c].median())
-    X_test_iso[c] = X_test_iso[c].fillna(X_train_iso[c].median())
+def build_if_matrix(df_fit, df_apply, num_cols, cat_cols):
+    X_num = df_apply[num_cols].copy()
 
+    for c in num_cols:
+        X_num[c] = pd.to_numeric(X_num[c], errors="coerce")
+        med = pd.to_numeric(df_fit[c], errors="coerce").median()
+        X_num[c] = X_num[c].fillna(med)
 
+    X_cat = pd.DataFrame(index=df_apply.index)
 
+    for c in cat_cols:
+        freq_map = (
+            df_fit[c]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .value_counts(normalize=True)
+        )
+        X_cat[c + "__freq"] = (
+            df_apply[c]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .map(freq_map)
+            .fillna(0)
+        )
 
+    X_all = pd.concat([X_num, X_cat], axis=1)
+    return X_all
 
-scaler = StandardScaler()
-X_train_iso_s = scaler.fit_transform(X_train_iso)
-X_test_iso_s = scaler.transform(X_test_iso)
+X_pre_if = build_if_matrix(pre_df, pre_df, iso_num_features, iso_cat_features)
+X_post_if = build_if_matrix(pre_df, post_df, iso_num_features, iso_cat_features)
+X_all_if = build_if_matrix(pre_df, df, iso_num_features, iso_cat_features)
 
-iso_model = IsolationForest(
+scaler_if = StandardScaler()
+X_pre_if_s = scaler_if.fit_transform(X_pre_if)
+X_post_if_s = scaler_if.transform(X_post_if)
+X_all_if_s = scaler_if.transform(X_all_if)
+
+iso_break = IsolationForest(
     n_estimators=400,
     contamination="auto",
     random_state=RANDOM_STATE,
     n_jobs=-1
 )
-iso_model.fit(X_train_iso_s)
+iso_break.fit(X_pre_if_s)
 
-train["risk_iso"] = -iso_model.score_samples(X_train_iso_s)
-test["risk_iso"] = -iso_model.score_samples(X_test_iso_s)
+pre_df["risk_iso_break"] = -iso_break.score_samples(X_pre_if_s)
+post_df["risk_iso_break"] = -iso_break.score_samples(X_post_if_s)
+df["risk_iso_break"] = -iso_break.score_samples(X_all_if_s)
 
+print("\n=== ISOLATION FOREST DEL QUIEBRE ===")
+print("Risk mean PRE :", round(pre_df["risk_iso_break"].mean(), 4))
+print("Risk mean POST:", round(post_df["risk_iso_break"].mean(), 4))
 
+# Umbral de anomalía usando el percentil 95 del período PRE
+iso_threshold = pre_df["risk_iso_break"].quantile(0.95)
+df["flag_anom_break"] = (df["risk_iso_break"] >= iso_threshold).astype(int)
 
+print("Threshold anomalía (p95 PRE):", round(iso_threshold, 4))
+print("Anomaly rate PRE :", round(pre_df.assign(flag=(pre_df['risk_iso_break'] >= iso_threshold).astype(int))['flag'].mean(), 4))
+print("Anomaly rate POST:", round(post_df.assign(flag=(post_df['risk_iso_break'] >= iso_threshold).astype(int))['flag'].mean(), 4))
 
-print("Promedio score ISO por clase - Train")
-display(train.groupby("y_rule")["risk_iso"].agg(["mean", "median", "std", "count"]))
+# ------------------------------------------------------------
+# 11) ANOMALÍAS DEL QUIEBRE POR CLUSTERS OPERATIVOS
+# ------------------------------------------------------------
+def anomaly_cluster_summary(data, cluster_col, min_size=15, top_n=20):
+    tmp = data[data[cluster_col].notna() & (data[cluster_col] != "")].copy()
 
-print("Promedio score ISO por clase - Test")
-display(test.groupby("y_rule")["risk_iso"].agg(["mean", "median", "std", "count"]))
+    g = tmp.groupby(cluster_col).agg(
+        n_total=(id_col, "count"),
+        n_post=("is_post", "sum"),
+        anom_rate=("flag_anom_break", "mean"),
+        avg_risk_iso=("risk_iso_break", "mean"),
+        avg_delta_break=("delta_break", "mean")
+    ).reset_index()
 
+    g = g[g["n_total"] >= min_size].copy()
+    return g.sort_values(["anom_rate", "n_post"], ascending=False).head(top_n)
 
+print("\n=== ANOMALÍAS DEL QUIEBRE POR CLUSTERS OPERATIVOS ===")
+for col in cluster_list:
+    print(f"\n--- {col} ---")
+    display(anomaly_cluster_summary(df, col, min_size=15, top_n=20))
 
+# ------------------------------------------------------------
+# 12) CASOS MÁS REPRESENTATIVOS DEL QUIEBRE
+# ------------------------------------------------------------
+# Queremos casos:
+# - post quiebre
+# - alto risk_break_ext
+# - alto delta_break (mejor explicados por nuevas variables)
+# - alta anomalía histórica
 
-for k in [50, 100, 200, 500]:
-    if k <= len(test):
-        print(f"IsolationForest Precision@{k}: {precision_at_k(test['y_rule'], test['risk_iso'], k):.3f}")
+post_candidates = df[df["is_post"] == 1].copy()
 
+post_candidates["risk_break_ext_z"] = zscore(post_candidates["risk_break_ext"])
+post_candidates["delta_break_z"] = zscore(post_candidates["delta_break"])
+post_candidates["risk_iso_break_z"] = zscore(post_candidates["risk_iso_break"])
 
+post_candidates["score_quiebre_final"] = (
+    0.5 * post_candidates["risk_break_ext_z"] +
+    0.3 * post_candidates["delta_break_z"] +
+    0.2 * post_candidates["risk_iso_break_z"]
+)
 
-
-## Score final combinado
-
-Se combina el score supervisado y el score no supervisado para priorizar casos que sean:
-- similares al patrón históricamente sospechoso
-- y además anómalos respecto al comportamiento general
-
-
-
-def zscore(s):
-    return (s - s.mean()) / s.std()
-
-test["risk_cat_z"] = zscore(test["risk_cat"])
-test["risk_iso_z"] = zscore(test["risk_iso"])
-
-test["risk_final"] = 0.7 * test["risk_cat_z"] + 0.3 * test["risk_iso_z"]
-
-
-
-
-for k in [50, 100, 200, 500]:
-    if k <= len(test):
-        print(f"Score combinado Precision@{k}: {precision_at_k(test['y_rule'], test['risk_final'], k):.3f}")
-
-
-
-
-
-cols_review = [c for c in [
+cols_quiebre_review = [c for c in [
     id_col,
     "FEC_OCURRENCIA_FINAL",
     "RUT_JOIN",
@@ -573,12 +770,12 @@ cols_review = [c for c in [
     "CANAL_VENTA_SEG",
     "SUCURSAL_VENTA_SEG",
     "MEDIO_PAGO_SEG",
-    "COB",
     "PLAN_AUX",
+    "COB",
     "AGRUPACION_QS",
+    "GLOSA_GIRO_PER",
     "DIF_VIGENCIA",
     "USO_TOPE",
-    "MONTO_FINAL_UF",
     "COUNT_OF_NUMERO_FINAL",
     "CUENTA_SIN_FAMILIAR_AUX",
     "N_SEG_12M_PRE_OCURR",
@@ -587,31 +784,28 @@ cols_review = [c for c in [
     "FLAG_EVASION_TOPE_75_80",
     "FLAG_MULTI_SEGURO",
     "FLAG_SIN_CRUZADA",
-    "y_rule",
-    "risk_cat",
-    "risk_iso",
-    "risk_final"
-] if c in test.columns]
+    "risk_break_base",
+    "risk_break_ext",
+    "delta_break",
+    "risk_iso_break",
+    "score_quiebre_final"
+] if c in post_candidates.columns]
 
-top_review = test.sort_values("risk_final", ascending=False)[cols_review].head(300)
-top_review.to_csv("top300_review_post_ago2024.csv", index=False)
+top_quiebre = post_candidates.sort_values("score_quiebre_final", ascending=False)[cols_quiebre_review].head(300)
+top_quiebre.to_csv("top300_quiebre_post_ago2024.csv", index=False)
 
-top_review.head(20)
+print("\n=== TOP CASOS DEL QUIEBRE EXPORTADOS ===")
+display(top_quiebre.head(20))
 
-
-
-## Interpretación final esperada
-
-- La **clusterización operativa** permite detectar si el aumento post agosto 2024 está concentrado en ciertas direcciones, comunas, canales, sucursales o combinaciones de estas variables.
-- El **modelo supervisado CatBoost** permite estimar qué casos nuevos se parecen más al perfil históricamente sospechoso.
-- El **Isolation Forest** complementa el análisis detectando anomalías, lo que es especialmente útil si el fraude posterior a agosto 2024 evolucionó y ya no sigue exactamente las reglas históricas.
-- El **score combinado** permite priorizar casos para revisión operativa.
-
-
-
-
-
-
+# ------------------------------------------------------------
+# 13) RESUMEN INTERPRETABLE FINAL
+# ------------------------------------------------------------
+print("\n================ RESUMEN =================")
+print("1) Si el modelo extendido supera al baseline, las variables nuevas sí agregan explicación del quiebre.")
+print("2) Revisa new_signal_df: ahí están las variables nuevas más importantes.")
+print("3) Revisa shift_tables: ahí ves en qué categorías se concentra el cambio pre/post.")
+print("4) Revisa anomaly_cluster_summary: ahí ves dónde se concentran las anomalías históricas.")
+print("5) Revisa top_quiebre: ahí están los casos post-AGO-2024 más representativos del quiebre.")
 
 
 
