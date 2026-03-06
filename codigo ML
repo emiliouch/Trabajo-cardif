@@ -137,59 +137,83 @@ print("Proporción post AGO-2024:", round(df["is_post"].mean(), 4))
 
 
 
+## Clusters operativos
 
 
-## Clusterización operativa
+En esta sección no se aplica clusterización no supervisada algorítmica.
 
-En vez de usar una clusterización abstracta difícil de interpretar, se crean agrupaciones operativas directamente accionables:
+En su lugar, se construyen **clusters operativos definidos por negocio**, con el objetivo de identificar concentraciones concretas del fenómeno post agosto 2024 en variables geográficas, comerciales y de contratación.
 
-- dirección
-- comuna + canal + sucursal
-- medio de pago + frecuencia
-- agrupación QS + comuna
+Los clusters operativos considerados son:
 
-El objetivo es identificar focos concretos del aumento post agosto 2024.
+- **comuna + canal**
+- **comuna + agrupación_qs**
+- **medio de pago + frecuencia**
+- **comuna + medio de pago**
+
+Este enfoque se eligió porque entrega grupos más interpretables y accionables para el problema estudiado, evitando clusters abstractos difíciles de explicar o utilizar operativamente.
 
 
+# =========================
+# Construcción de clusters operativos
+# =========================
 
-# Cluster por dirección
-if "DIRECCION_PER" in df.columns:
-    df["cluster_addr"] = df["DIRECCION_PER"]
-else:
-    df["cluster_addr"] = ""
+# Asegurar strings limpios
+cluster_cols = [
+    "COMUNA_PER",
+    "CANAL_VENTA_SEG",
+    "AGRUPACION_QS",
+    "MEDIO_PAGO_SEG",
+    "FRECUENCIA_PAGO"
+]
 
-# Cluster operativo: comuna + canal + sucursal
-ops_parts = []
-for c in ["COMUNA_PER", "CANAL_VENTA_SEG", "SUCURSAL_VENTA_SEG"]:
+for c in cluster_cols:
     if c in df.columns:
-        ops_parts.append(df[c])
+        df[c] = df[c].fillna("").astype(str).str.strip().str.upper()
 
-if ops_parts:
-    df["cluster_ops"] = ops_parts[0]
-    for p in ops_parts[1:]:
-        df["cluster_ops"] = df["cluster_ops"] + "|" + p
+# 1) Cluster comuna + canal
+if "COMUNA_PER" in df.columns and "CANAL_VENTA_SEG" in df.columns:
+    df["cluster_comuna_canal"] = df["COMUNA_PER"] + "|" + df["CANAL_VENTA_SEG"]
 else:
-    df["cluster_ops"] = ""
+    df["cluster_comuna_canal"] = ""
 
-# Cluster de pago
+# 2) Cluster comuna + agrupacion_qs
+if "COMUNA_PER" in df.columns and "AGRUPACION_QS" in df.columns:
+    df["cluster_comuna_qs"] = df["COMUNA_PER"] + "|" + df["AGRUPACION_QS"]
+else:
+    df["cluster_comuna_qs"] = ""
+
+# 3) Cluster medio pago + frecuencia
 if "MEDIO_PAGO_SEG" in df.columns and "FRECUENCIA_PAGO" in df.columns:
-    df["cluster_pay"] = df["MEDIO_PAGO_SEG"] + "|" + df["FRECUENCIA_PAGO"]
+    df["cluster_pago_freq"] = df["MEDIO_PAGO_SEG"] + "|" + df["FRECUENCIA_PAGO"]
 else:
-    df["cluster_pay"] = ""
+    df["cluster_pago_freq"] = ""
 
-# Cluster QS + geografía
-if "AGRUPACION_QS" in df.columns and "COMUNA_PER" in df.columns:
-    df["cluster_qs_geo"] = df["AGRUPACION_QS"] + "|" + df["COMUNA_PER"]
+# 4) Cluster comuna + medio pago
+if "COMUNA_PER" in df.columns and "MEDIO_PAGO_SEG" in df.columns:
+    df["cluster_comuna_pago"] = df["COMUNA_PER"] + "|" + df["MEDIO_PAGO_SEG"]
 else:
-    df["cluster_qs_geo"] = ""
+    df["cluster_comuna_pago"] = ""
 
 
+### Resumen de clusters operativos
+
+Para cada cluster operativo se calculan las siguientes métricas:
+
+- número total de siniestros
+- número de siniestros pre agosto 2024
+- número de siniestros post agosto 2024
+- proporción post agosto 2024 dentro del cluster
+- tasa de sospecha operativa (`y_rule`)
+- tasa de evasión de umbrales
+- tasa de multi-seguro
+- tasa de siniestralidad cruzada
+
+Además, se calcula un indicador `lift_post`, que mide cuánto más concentrado está el cluster en el período post agosto 2024 respecto del promedio general.
 
 
-
-
-def cluster_summary(data, cluster_col, min_size=10, top_n=30):
-    tmp = data[data[cluster_col].ne("")].copy()
+def cluster_summary(data, cluster_col, min_size=15, top_n=30):
+    tmp = data[data[cluster_col].notna() & (data[cluster_col] != "")].copy()
 
     g = tmp.groupby(cluster_col).agg(
         n_total=(id_col, "count"),
@@ -204,37 +228,75 @@ def cluster_summary(data, cluster_col, min_size=10, top_n=30):
 
     g = g[g["n_total"] >= min_size].copy()
 
-    overall_post = tmp["is_post"].mean()
-    g["lift_post"] = g["post_rate"] / overall_post if overall_post > 0 else np.nan
+    overall_post_rate = tmp["is_post"].mean()
+    if overall_post_rate > 0:
+        g["lift_post"] = g["post_rate"] / overall_post_rate
+    else:
+        g["lift_post"] = np.nan
 
     return g.sort_values(["n_post", "lift_post"], ascending=False).head(top_n)
 
 
+### Tablas principales de clusters operativos
+
+A continuación se generan las tablas resumen para los cuatro clusters definidos.  
+Estas tablas permiten detectar cuáles combinaciones presentan mayor concentración del fenómeno post agosto 2024 y mayor asociación con sospecha operativa.
 
 
 cluster_tables = {}
 
-for col in ["cluster_addr", "cluster_ops", "cluster_pay", "cluster_qs_geo"]:
+cluster_list = [
+    "cluster_comuna_canal",
+    "cluster_comuna_qs",
+    "cluster_pago_freq",
+    "cluster_comuna_pago"
+]
+
+for col in cluster_list:
     cluster_tables[col] = cluster_summary(df, col, min_size=15, top_n=30)
     print(f"\n=== {col} ===")
     display(cluster_tables[col].head(20))
 
 
+### Visualización de clusters operativos
+
+Se visualizan los clusters con mayor volumen de siniestros post agosto 2024, con el fin de identificar focos prioritarios para el análisis.
 
 
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+sns.set_style("whitegrid")
+
+for col in cluster_list:
+    top_df = cluster_tables[col].head(15).copy()
+
+    plt.figure(figsize=(10, 6))
+    sns.barplot(data=top_df, y=col, x="n_post")
+    plt.title(f"Top clusters operativos por volumen post AGO-2024: {col}")
+    plt.xlabel("N siniestros post AGO-2024")
+    plt.ylabel("Cluster")
+    plt.tight_layout()
+    plt.show()
 
 
-top_ops = cluster_tables["cluster_ops"].head(15).copy()
+### Criterios de interpretación
 
-plt.figure(figsize=(10, 6))
-sns.barplot(data=top_ops, y="cluster_ops", x="n_post")
-plt.title("Top clusters operativos por volumen post AGO-2024")
-plt.xlabel("N siniestros post AGO-2024")
-plt.ylabel("Cluster operativo")
-plt.tight_layout()
-plt.show()
+Un cluster operativo se considera especialmente relevante cuando combina varios de los siguientes elementos:
+
+- alto volumen de siniestros post agosto 2024 (`n_post`)
+- alto `lift_post`, es decir, sobrerrepresentación en el período post agosto 2024
+- alta tasa de sospecha operativa (`y_rate`)
+- alta tasa de evasión de umbrales (`evasion_rate`)
+- alta proporción de multi-seguro (`multiseg_rate`)
+- alta siniestralidad cruzada (`cross_rate`)
+
+Este análisis permite distinguir si el aumento posterior a agosto 2024 se concentra en ciertos focos específicos o si, por el contrario, se distribuye de manera más difusa.
 
 
+En lugar de aplicar una clusterización no supervisada algorítmica, se optó por construir clusters operativos definidos por negocio. Esta decisión se tomó porque el objetivo del proyecto no era encontrar agrupaciones abstractas difíciles de interpretar, sino identificar focos concretos y accionables del aumento post agosto 2024.
+
+Por ello, se definieron cuatro clusters operativos compuestos: comuna + canal, comuna + agrupación_qs, medio de pago + frecuencia y comuna + medio de pago. Estas combinaciones permiten capturar de forma más clara la interacción entre variables geográficas, comerciales y de contratación, facilitando tanto la interpretación del fenómeno como su eventual uso operativo.
 
 
 
