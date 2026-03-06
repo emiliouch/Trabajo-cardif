@@ -373,51 +373,50 @@ X_test = test[model_features].copy()
 y_train = train["y_rule"].astype(int)
 y_test = test["y_rule"].astype(int)
 
-for c in num_features:
-    X_train[c] = pd.to_numeric(X_train[c], errors="coerce")
-    X_test[c] = pd.to_numeric(X_test[c], errors="coerce")
-
-for c in cat_features:
-    X_train[c] = X_train[c].fillna("").astype(str)
-    X_test[c] = X_test[c].fillna("").astype(str)
-
-cat_idx = [X_train.columns.get_loc(c) for c in cat_features]
-
-train_pool = Pool(X_train, y_train, cat_features=cat_idx)
-test_pool = Pool(X_test, y_test, cat_features=cat_idx)
 
 
 
 
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median"))
+])
 
-pos_rate = y_train.mean()
-neg_rate = 1 - pos_rate
-pos_weight = neg_rate / max(pos_rate, 1e-6)
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="constant", fill_value="MISSING")),
+    ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
+])
 
-cat_model = CatBoostClassifier(
-    iterations=800,
-    depth=6,
-    learning_rate=0.03,
-    loss_function="Logloss",
-    eval_metric="AUC",
-    random_seed=RANDOM_STATE,
-    verbose=100,
-    class_weights=[1, pos_weight]
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, num_features),
+        ("cat", categorical_transformer, cat_features)
+    ],
+    remainder="drop"
 )
 
-cat_model.fit(train_pool, eval_set=test_pool, use_best_model=True)
+hgb_model = HistGradientBoostingClassifier(
+    learning_rate=0.03,
+    max_iter=500,
+    max_depth=6,
+    min_samples_leaf=30,
+    l2_regularization=1.0,
+    random_state=RANDOM_STATE
+)
 
-train["risk_cat"] = cat_model.predict_proba(train_pool)[:, 1]
-test["risk_cat"] = cat_model.predict_proba(test_pool)[:, 1]
+clf = Pipeline(steps=[
+    ("preprocessor", preprocessor),
+    ("model", hgb_model)
+])
 
-print("CatBoost AUC train:", round(roc_auc_score(y_train, train["risk_cat"]), 4))
-print("CatBoost AUC test :", round(roc_auc_score(y_test, test["risk_cat"]), 4))
-print("CatBoost PR-AUC train:", round(average_precision_score(y_train, train["risk_cat"]), 4))
-print("CatBoost PR-AUC test :", round(average_precision_score(y_test, test["risk_cat"]), 4))
+clf.fit(X_train, y_train)
 
+train["risk_hgb"] = clf.predict_proba(X_train)[:, 1]
+test["risk_hgb"] = clf.predict_proba(X_test)[:, 1]
 
-
-
+print("HGB AUC train:", round(roc_auc_score(y_train, train["risk_hgb"]), 4))
+print("HGB AUC test :", round(roc_auc_score(y_test, test["risk_hgb"]), 4))
+print("HGB PR-AUC train:", round(average_precision_score(y_train, train["risk_hgb"]), 4))
+print("HGB PR-AUC test :", round(average_precision_score(y_test, test["risk_hgb"]), 4))
 
 def precision_at_k(y_true, scores, k):
     idx = np.argsort(scores)[::-1][:k]
@@ -425,30 +424,42 @@ def precision_at_k(y_true, scores, k):
 
 for k in [50, 100, 200, 500]:
     if k <= len(test):
-        print(f"CatBoost Precision@{k}: {precision_at_k(test['y_rule'], test['risk_cat'], k):.3f}")
+        print(f"HGB Precision@{k}: {precision_at_k(test['y_rule'], test['risk_hgb'], k):.3f}")
+
+
+perm = permutation_importance(
+    clf,
+    X_test,
+    y_test,
+    n_repeats=10,
+    random_state=RANDOM_STATE,
+    scoring="average_precision"
+)
+
+feature_names = model_features
+
+perm_df = pd.DataFrame({
+    "feature": feature_names,
+    "importance_mean": perm.importances_mean,
+    "importance_std": perm.importances_std
+}).sort_values("importance_mean", ascending=False)
+
+perm_df.head(20)
 
 
 
-sample_for_shap = X_test.sample(min(2000, len(X_test)), random_state=RANDOM_STATE)
-
-explainer = shap.TreeExplainer(cat_model)
-shap_values = explainer.shap_values(sample_for_shap)
+top_perm = perm_df.head(15).copy()
 
 plt.figure(figsize=(10, 6))
-shap.summary_plot(shap_values, sample_for_shap, show=False)
-plt.title("SHAP Summary - CatBoost")
+sns.barplot(data=top_perm, y="feature", x="importance_mean")
+plt.title("Permutation Importance - HistGradientBoosting")
+plt.xlabel("Importancia media")
+plt.ylabel("Variable")
 plt.tight_layout()
 plt.show()
 
 
 
-
-shap_importance = pd.DataFrame({
-    "feature": sample_for_shap.columns,
-    "mean_abs_shap": np.abs(shap_values).mean(axis=0)
-}).sort_values("mean_abs_shap", ascending=False)
-
-shap_importance.head(20)
 
 
 
