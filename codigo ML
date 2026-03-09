@@ -988,26 +988,30 @@ if "AGRUPACION_QS" in sub.columns:
 # -----------------------------
 # 8) Visualización
 # -----------------------------
-plt.figure(figsize=(10, 5))
-sns.boxplot(data=sub, x="grupo_falabella", y="DIF_VIGENCIA", showfliers=False)
-plt.title("DIF_VIGENCIA de pagados - COMPRA PROTEGIDA X ROBO")
-plt.xlabel("")
+# Socios / agrupaciones a comparar visualmente
+top_qs_plot = (
+    sub["AGRUPACION_QS"]
+    .value_counts()
+    .head(10)
+    .index
+)
+
+sub_plot = sub[sub["AGRUPACION_QS"].isin(top_qs_plot)].copy()
+
+plt.figure(figsize=(14, 6))
+sns.boxplot(data=sub_plot, x="AGRUPACION_QS", y="DIF_VIGENCIA", showfliers=False)
+plt.title("DIF_VIGENCIA de pagados - COMPRA PROTEGIDA X ROBO por Agrupación_QS")
+plt.xlabel("Agrupación_QS")
 plt.ylabel("DIF_VIGENCIA")
+plt.xticks(rotation=45, ha="right")
 plt.tight_layout()
 plt.show()
 
-plt.figure(figsize=(10, 5))
-sns.histplot(
-    data=sub,
-    x="DIF_VIGENCIA",
-    hue="grupo_falabella",
-    bins=40,
-    stat="density",
-    common_norm=False,
-    element="step"
-)
-plt.title("Distribución de DIF_VIGENCIA de pagados - COMPRA PROTEGIDA X ROBO")
-plt.xlabel("DIF_VIGENCIA")
-plt.ylabel("Densidad")
+plt.figure(figsize=(14, 6))
+sns.violinplot(data=sub_plot, x="AGRUPACION_QS", y="DIF_VIGENCIA", cut=0)
+plt.title("Distribución de DIF_VIGENCIA de pagados - COMPRA PROTEGIDA X ROBO por Agrupación_QS")
+plt.xlabel("Agrupación_QS")
+plt.ylabel("DIF_VIGENCIA")
+plt.xticks(rotation=45, ha="right")
 plt.tight_layout()
 plt.show()
