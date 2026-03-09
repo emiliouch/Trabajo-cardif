@@ -614,3 +614,230 @@ print("3) Revisa los archivos 'shift_*.csv': ahí ves en qué categorías se con
 print("4) Revisa los archivos 'anom_*.csv': ahí ves dónde se concentran las anomalías históricas.")
 print("5) Revisa 'top300_quiebre_post_ago2024.csv': ahí están los casos post-AGO-2024 más representativos del quiebre.")
 print(f"\nOutputs guardados en: {os.path.abspath(OUT_DIR)}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# AUDITORÍA DE LEGITIMIDAD DE AGRUPACION_QS = FALABELLA
+# Objetivo:
+# verificar si n_pre=1 y n_post=1229 parece un fenómeno real
+# o un posible problema de mapeo / clasificación histórica
+# ============================================================
+
+import numpy as np
+import pandas as pd
+
+# -----------------------------
+# Configuración básica
+# -----------------------------
+break_date = pd.Timestamp("2024-08-01")
+
+# Copia de trabajo
+audit = df.copy()
+
+# -----------------------------
+# Validaciones mínimas
+# -----------------------------
+required_cols = ["FEC_OCURRENCIA_FINAL", "AGRUPACION_QS", "POLIZA_JOIN"]
+missing = [c for c in required_cols if c not in audit.columns]
+if missing:
+    raise ValueError(f"Faltan columnas necesarias para la auditoría: {missing}")
+
+# Normalización básica
+audit["FEC_OCURRENCIA_FINAL"] = pd.to_datetime(audit["FEC_OCURRENCIA_FINAL"], errors="coerce")
+audit["AGRUPACION_QS"] = audit["AGRUPACION_QS"].fillna("").astype(str).str.strip().str.upper()
+audit["POLIZA_JOIN"] = audit["POLIZA_JOIN"].fillna("").astype(str).str.strip().str.upper()
+
+# ID siniestro
+id_col = "KEY_CLAIM"
+if id_col not in audit.columns:
+    candidates = [c for c in ["NUMERO_FINAL_C", "NUMERO_FINAL", "ID"] if c in audit.columns]
+    if not candidates:
+        raise ValueError("No encuentro una columna identificadora del siniestro.")
+    id_col = candidates[0]
+
+# Quitar duplicados por siniestro por seguridad
+audit = audit.drop_duplicates(subset=[id_col]).copy()
+
+# Variables auxiliares
+audit["is_post"] = (audit["FEC_OCURRENCIA_FINAL"] >= break_date).astype(int)
+audit["year_month"] = audit["FEC_OCURRENCIA_FINAL"].dt.to_period("M").astype(str)
+
+# -----------------------------
+# 1) Resumen general por AGRUPACION_QS
+# -----------------------------
+qs_summary = (
+    audit[audit["AGRUPACION_QS"] != ""]
+    .groupby("AGRUPACION_QS")
+    .agg(
+        n_total=(id_col, "count"),
+        n_pre=("is_post", lambda x: (x == 0).sum()),
+        n_post=("is_post", "sum"),
+        min_fecha=("FEC_OCURRENCIA_FINAL", "min"),
+        max_fecha=("FEC_OCURRENCIA_FINAL", "max"),
+        n_polizas=("POLIZA_JOIN", "nunique"),
+    )
+    .reset_index()
+)
+
+qs_summary["post_share"] = qs_summary["n_post"] / qs_summary["n_total"]
+qs_summary = qs_summary.sort_values(["n_post", "n_total"], ascending=False)
+
+print("\n================ RESUMEN AGRUPACION_QS ================")
+display(qs_summary.head(20))
+
+# -----------------------------
+# 2) Foco Falabella
+# -----------------------------
+fal = audit[audit["AGRUPACION_QS"] == "FALABELLA"].copy()
+
+print("\n================ FALABELLA - RESUMEN GENERAL ================")
+if fal.empty:
+    print("No hay registros con AGRUPACION_QS = FALABELLA.")
+else:
+    resumen_fal = pd.DataFrame({
+        "n_total": [len(fal)],
+        "n_pre": [(fal["is_post"] == 0).sum()],
+        "n_post": [fal["is_post"].sum()],
+        "n_polizas": [fal["POLIZA_JOIN"].nunique()],
+        "fecha_min": [fal["FEC_OCURRENCIA_FINAL"].min()],
+        "fecha_max": [fal["FEC_OCURRENCIA_FINAL"].max()],
+    })
+    display(resumen_fal)
+
+    # -----------------------------
+    # 3) Serie mensual Falabella
+    # -----------------------------
+    fal_month = (
+        fal.groupby("year_month")
+        .agg(
+            n_siniestros=(id_col, "count"),
+            n_polizas=("POLIZA_JOIN", "nunique")
+        )
+        .reset_index()
+        .sort_values("year_month")
+    )
+
+    print("\n================ FALABELLA - SERIE MENSUAL ================")
+    display(fal_month.tail(30))
+
+    # -----------------------------
+    # 4) Falabella por póliza
+    # -----------------------------
+    fal_poliza = (
+        fal.groupby("POLIZA_JOIN")
+        .agg(
+            n_total=(id_col, "count"),
+            n_pre=("is_post", lambda x: (x == 0).sum()),
+            n_post=("is_post", "sum"),
+            fecha_min=("FEC_OCURRENCIA_FINAL", "min"),
+            fecha_max=("FEC_OCURRENCIA_FINAL", "max"),
+        )
+        .reset_index()
+        .sort_values(["n_post", "n_total"], ascending=False)
+    )
+
+    fal_poliza["post_share"] = fal_poliza["n_post"] / fal_poliza["n_total"]
+
+    print("\n================ FALABELLA - POR PÓLIZA ================")
+    display(fal_poliza.head(30))
+
+    # -----------------------------
+    # 5) Primera aparición por póliza
+    # -----------------------------
+    fal_poliza["first_is_post"] = (fal_poliza["fecha_min"] >= break_date).astype(int)
+
+    first_post_rate = fal_poliza["first_is_post"].mean()
+    print("\nProporción de pólizas Falabella cuya PRIMERA aparición ya es post-AGO2024:", round(first_post_rate, 4))
+
+    print("\n================ FALABELLA - PÓLIZAS CUYA PRIMERA APARICIÓN ES PRE ================")
+    display(fal_poliza[fal_poliza["first_is_post"] == 0].sort_values("fecha_min").head(30))
+
+    # -----------------------------
+    # 6) Perfil Falabella en variables clave
+    # -----------------------------
+    profile_cols = [c for c in ["CANAL_VENTA_SEG", "MEDIO_PAGO_SEG", "FRECUENCIA_PAGO", "COB", "PLAN_AUX", "COMUNA_PER"] if c in fal.columns]
+
+    for c in profile_cols:
+        tmp = (
+            fal[fal[c].fillna("").astype(str).str.strip() != ""]
+            .groupby(c)
+            .agg(
+                n_total=(id_col, "count"),
+                n_pre=("is_post", lambda x: (x == 0).sum()),
+                n_post=("is_post", "sum"),
+            )
+            .reset_index()
+            .sort_values(["n_post", "n_total"], ascending=False)
+            .head(20)
+        )
+        if not tmp.empty:
+            tmp["post_share"] = tmp["n_post"] / tmp["n_total"]
+            print(f"\n================ FALABELLA - PERFIL POR {c} ================")
+            display(tmp)
+
+    # -----------------------------
+    # 7) Comparación Falabella vs no Falabella
+    # -----------------------------
+    compare_cols = [c for c in [
+        "DIF_VIGENCIA", "USO_TOPE", "COUNT_OF_NUMERO_FINAL", "CUENTA_SIN_FAMILIAR_AUX",
+        "N_SEG_12M_PRE_OCURR", "N_SIN_OTRAS_COB", "MONTO_FINAL_UF", "EDAD_AL_SINIESTRO"
+    ] if c in audit.columns]
+
+    if compare_cols:
+        compare_df = audit.copy()
+        compare_df["is_falabella"] = (compare_df["AGRUPACION_QS"] == "FALABELLA").astype(int)
+
+        comp = compare_df.groupby("is_falabella")[compare_cols].mean().T
+        comp.columns = ["NO_FALABELLA", "FALABELLA"]
+        comp["diff_fal_minus_nonfal"] = comp["FALABELLA"] - comp["NO_FALABELLA"]
+
+        print("\n================ COMPARACIÓN NUMÉRICA FALABELLA VS RESTO ================")
+        display(comp.sort_values("diff_fal_minus_nonfal", ascending=False))
+
+    # -----------------------------
+    # 8) Revisar si el único PRE de Falabella está aislado
+    # -----------------------------
+    fal_pre = fal[fal["is_post"] == 0].copy()
+    print("\n================ FALABELLA - REGISTROS PRE ================")
+    display(
+        fal_pre[[c for c in [
+            id_col, "FEC_OCURRENCIA_FINAL", "POLIZA_JOIN", "CANAL_VENTA_SEG",
+            "MEDIO_PAGO_SEG", "FRECUENCIA_PAGO", "COB", "PLAN_AUX", "COMUNA_PER"
+        ] if c in fal_pre.columns]].head(50)
+    )
+
+    # -----------------------------
+    # 9) Guardar outputs útiles
+    # -----------------------------
+    fal_month.to_csv("audit_falabella_monthly.csv", index=False)
+    fal_poliza.to_csv("audit_falabella_by_policy.csv", index=False)
+    qs_summary.to_csv("audit_qs_summary.csv", index=False)
+
+    print("\nArchivos guardados:")
+    print("- audit_qs_summary.csv")
+    print("- audit_falabella_monthly.csv")
+    print("- audit_falabella_by_policy.csv")
