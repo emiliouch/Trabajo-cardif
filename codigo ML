@@ -841,3 +841,173 @@ else:
     print("- audit_qs_summary.csv")
     print("- audit_falabella_monthly.csv")
     print("- audit_falabella_by_policy.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+needed = ["DIF_VIGENCIA", "COB"]
+missing = [c for c in needed if c not in df.columns]
+if missing:
+    raise ValueError(f"Faltan columnas necesarias: {missing}")
+
+work = df.copy()
+
+# Normalización básica
+work["COB"] = work["COB"].fillna("").astype(str).str.strip().str.upper()
+if "AGRUPACION_QS" in work.columns:
+    work["AGRUPACION_QS"] = work["AGRUPACION_QS"].fillna("").astype(str).str.strip().str.upper()
+if "SOCIO" in work.columns:
+    work["SOCIO"] = work["SOCIO"].fillna("").astype(str).str.strip().str.upper()
+
+work["DIF_VIGENCIA"] = pd.to_numeric(work["DIF_VIGENCIA"], errors="coerce")
+
+# -----------------------------
+# 2) Definir "pagados"
+# Prioridad:
+# - usar COD == 'PAG' si existe
+# - si no, usar ESTADOCUOTA con estados pagados
+# -----------------------------
+if "COD" in work.columns:
+    paid_mask = work["COD"].fillna("").astype(str).str.strip().str.upper().eq("PAG")
+elif "ESTADOCUOTA" in work.columns:
+    paid_states = {"PAGO TOTAL", "PAGO PARCIAL", "NUEVO PAGO", "RECUPERO"}
+    paid_mask = work["ESTADOCUOTA"].fillna("").astype(str).str.strip().str.upper().isin(paid_states)
+else:
+    raise ValueError("No encuentro ni COD ni ESTADOCUOTA para identificar pagados.")
+
+# -----------------------------
+# 3) Filtrar cobertura objetivo
+# -----------------------------
+cob_target = "COMPRA PROTEGIDA X ROBO"
+cob_mask = work["COB"].eq(cob_target)
+
+sub = work.loc[paid_mask & cob_mask].copy()
+
+if sub.empty:
+    raise ValueError("No hay registros pagados para COB = COMPRA PROTEGIDA X ROBO.")
+
+# -----------------------------
+# 4) Definir grupo Falabella vs Otros
+# Prioridad:
+# - AGRUPACION_QS
+# - si no existe, intentar SOCIO
+# -----------------------------
+if "AGRUPACION_QS" in sub.columns:
+    sub["grupo_falabella"] = np.where(sub["AGRUPACION_QS"].eq("FALABELLA"), "FALABELLA", "OTROS")
+elif "SOCIO" in sub.columns:
+    sub["grupo_falabella"] = np.where(sub["SOCIO"].str.contains("FALABELLA", na=False), "FALABELLA", "OTROS")
+else:
+    raise ValueError("No encuentro AGRUPACION_QS ni SOCIO para separar Falabella vs otros.")
+
+# Quitar DIF_VIGENCIA missing
+sub = sub[sub["DIF_VIGENCIA"].notna()].copy()
+
+# -----------------------------
+# 5) Tabla resumen principal
+# -----------------------------
+def pct(cond):
+    return cond.mean() if len(cond) > 0 else np.nan
+
+summary = (
+    sub.groupby("grupo_falabella")
+    .agg(
+        n=("DIF_VIGENCIA", "count"),
+        media=("DIF_VIGENCIA", "mean"),
+        mediana=("DIF_VIGENCIA", "median"),
+        p25=("DIF_VIGENCIA", lambda x: x.quantile(0.25)),
+        p75=("DIF_VIGENCIA", lambda x: x.quantile(0.75)),
+        p90=("DIF_VIGENCIA", lambda x: x.quantile(0.90)),
+        min=("DIF_VIGENCIA", "min"),
+        max=("DIF_VIGENCIA", "max"),
+        pct_menor_31=("DIF_VIGENCIA", lambda x: (x < 31).mean()),
+        pct_31_45=("DIF_VIGENCIA", lambda x: ((x >= 31) & (x <= 45)).mean()),
+        pct_31_59=("DIF_VIGENCIA", lambda x: ((x >= 31) & (x <= 59)).mean()),
+        pct_menor_60=("DIF_VIGENCIA", lambda x: (x < 60).mean()),
+        pct_menor_180=("DIF_VIGENCIA", lambda x: (x < 180).mean()),
+    )
+    .reset_index()
+)
+
+print("\n================ RESUMEN DIF_VIGENCIA PAGADOS =================")
+display(summary)
+
+# -----------------------------
+# 6) Resumen adicional por tramos
+# -----------------------------
+sub["tramo_dif_vig"] = pd.cut(
+    sub["DIF_VIGENCIA"],
+    bins=[-np.inf, 30, 45, 59, 89, 179, 364, np.inf],
+    labels=["<31", "31-45", "46-59", "60-89", "90-179", "180-364", "365+"]
+)
+
+tramos = (
+    sub.groupby(["grupo_falabella", "tramo_dif_vig"])
+    .size()
+    .reset_index(name="n")
+)
+
+totals = tramos.groupby("grupo_falabella")["n"].transform("sum")
+tramos["pct"] = tramos["n"] / totals
+
+print("\n================ DISTRIBUCIÓN POR TRAMOS =================")
+display(tramos)
+
+# -----------------------------
+# 7) Si quieres comparar con otros partners específicos en vez de "OTROS"
+# Usa AGRUPACION_QS si existe
+# -----------------------------
+if "AGRUPACION_QS" in sub.columns:
+    by_qs = (
+        sub.groupby("AGRUPACION_QS")
+        .agg(
+            n=("DIF_VIGENCIA", "count"),
+            media=("DIF_VIGENCIA", "mean"),
+            mediana=("DIF_VIGENCIA", "median"),
+            p25=("DIF_VIGENCIA", lambda x: x.quantile(0.25)),
+            p75=("DIF_VIGENCIA", lambda x: x.quantile(0.75)),
+            pct_menor_31=("DIF_VIGENCIA", lambda x: (x < 31).mean()),
+            pct_31_45=("DIF_VIGENCIA", lambda x: ((x >= 31) & (x <= 45)).mean()),
+        )
+        .reset_index()
+        .sort_values(["n"], ascending=False)
+    )
+
+    print("\n================ DIF_VIGENCIA POR AGRUPACION_QS =================")
+    display(by_qs.head(15))
+
+# -----------------------------
+# 8) Visualización
+# -----------------------------
+plt.figure(figsize=(10, 5))
+sns.boxplot(data=sub, x="grupo_falabella", y="DIF_VIGENCIA", showfliers=False)
+plt.title("DIF_VIGENCIA de pagados - COMPRA PROTEGIDA X ROBO")
+plt.xlabel("")
+plt.ylabel("DIF_VIGENCIA")
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(10, 5))
+sns.histplot(
+    data=sub,
+    x="DIF_VIGENCIA",
+    hue="grupo_falabella",
+    bins=40,
+    stat="density",
+    common_norm=False,
+    element="step"
+)
+plt.title("Distribución de DIF_VIGENCIA de pagados - COMPRA PROTEGIDA X ROBO")
+plt.xlabel("DIF_VIGENCIA")
+plt.ylabel("Densidad")
+plt.tight_layout()
+plt.show()
