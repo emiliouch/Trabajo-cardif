@@ -1020,3 +1020,80 @@ plt.ylabel("DIF_VIGENCIA")
 plt.xticks(rotation=45, ha="right")
 plt.tight_layout()
 plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================
+# Siniestros en los primeros 10 días
+# % sobre el total de pagados en N y en monto
+# ============================================
+
+work = df.copy()
+
+# Normalización mínima
+work["DIF_VIGENCIA"] = pd.to_numeric(work["DIF_VIGENCIA"], errors="coerce")
+if "MONTO_FINAL_UF" in work.columns:
+    work["MONTO_FINAL_UF"] = pd.to_numeric(work["MONTO_FINAL_UF"], errors="coerce")
+elif "MONTO_FINAL" in work.columns:
+    work["MONTO_FINAL"] = pd.to_numeric(work["MONTO_FINAL"], errors="coerce")
+else:
+    raise ValueError("No encuentro ni MONTO_FINAL_UF ni MONTO_FINAL para calcular el porcentaje en monto.")
+
+# Identificar pagados
+if "COD" in work.columns:
+    paid_mask = work["COD"].fillna("").astype(str).str.strip().str.upper().eq("PAG")
+elif "ESTADOCUOTA" in work.columns:
+    paid_states = {"PAGO TOTAL", "PAGO PARCIAL", "NUEVO PAGO", "RECUPERO"}
+    paid_mask = work["ESTADOCUOTA"].fillna("").astype(str).str.strip().str.upper().isin(paid_states)
+else:
+    raise ValueError("No encuentro ni COD ni ESTADOCUOTA para identificar pagados.")
+
+pagados = work.loc[paid_mask].copy()
+
+# Elegir columna de monto
+monto_col = "MONTO_FINAL_UF" if "MONTO_FINAL_UF" in pagados.columns else "MONTO_FINAL"
+
+# Total pagados
+n_total_pagados = len(pagados)
+monto_total_pagados = pagados[monto_col].fillna(0).sum()
+
+# Primeros 10 días
+pagados_10d = pagados.loc[pagados["DIF_VIGENCIA"].notna() & (pagados["DIF_VIGENCIA"] <= 10)].copy()
+
+n_10d = len(pagados_10d)
+monto_10d = pagados_10d[monto_col].fillna(0).sum()
+
+pct_n_10d = n_10d / n_total_pagados if n_total_pagados > 0 else np.nan
+pct_monto_10d = monto_10d / monto_total_pagados if monto_total_pagados > 0 else np.nan
+
+resumen_10d = pd.DataFrame({
+    "n_pagados_total": [n_total_pagados],
+    "n_pagados_0_10d": [n_10d],
+    "pct_n_0_10d": [pct_n_10d],
+    f"monto_total_pagados_{monto_col}": [monto_total_pagados],
+    f"monto_0_10d_{monto_col}": [monto_10d],
+    f"pct_monto_0_10d_{monto_col}": [pct_monto_10d]
+})
+
+display(resumen_10d)
+
+print(f"Siniestros pagados en los primeros 10 días: {n_10d:,}")
+print(f"% del total de pagados en N: {pct_n_10d:.2%}")
+print(f"% del total de pagados en monto ({monto_col}): {pct_monto_10d:.2%}")
