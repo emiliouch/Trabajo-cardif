@@ -1040,16 +1040,19 @@ plt.show()
 
 
 
-# ============================================
+# ============================================================
 # Siniestros en los primeros 10 días
 # % sobre el total de pagados en N y en monto
-# POR AGRUPACION_QS
-# ============================================
+# por AGRUPACION_QS
+# Filtro: COB = "COMPRA PROTEGIDA X ROBO" y FECHA_OTORGAMIENTO >= 2025
+# ============================================================
 
 work = df.copy()
 
 # Normalización mínima
 work["DIF_VIGENCIA"] = pd.to_numeric(work["DIF_VIGENCIA"], errors="coerce")
+work["FEC_OTORGAMIENTO_FINAL"] = pd.to_datetime(work["FEC_OTORGAMIENTO_FINAL"], errors="coerce")
+work["COB"] = work["COB"].fillna("").astype(str).str.strip().str.upper()
 work["AGRUPACION_QS"] = work["AGRUPACION_QS"].fillna("").astype(str).str.strip().str.upper()
 
 if "MONTO_FINAL_UF" in work.columns:
@@ -1068,34 +1071,28 @@ elif "ESTADOCUOTA" in work.columns:
 else:
     raise ValueError("No encuentro ni COD ni ESTADOCUOTA para identificar pagados.")
 
-pagados = work.loc[paid_mask].copy()
+# Filtros adicionales
+cob_mask = work["COB"].eq("COMPRA PROTEGIDA X ROBO")
+fecha_mask = work["FEC_OTORGAMIENTO_FINAL"] >= pd.Timestamp("2025-01-01")
 
-# Opcional: excluir AGRUPACION_QS vacío
-pagados = pagados[pagados["AGRUPACION_QS"] != ""].copy()
+pagados = work.loc[paid_mask & cob_mask & fecha_mask].copy()
 
 # Elegir columna de monto
 monto_col = "MONTO_FINAL_UF" if "MONTO_FINAL_UF" in pagados.columns else "MONTO_FINAL"
 
-# Flag primeros 10 días
-pagados["flag_0_10d"] = np.where(
-    pagados["DIF_VIGENCIA"].notna() & (pagados["DIF_VIGENCIA"] <= 10),
-    1, 0
-)
-
-# Monto de primeros 10 días
-pagados["monto_0_10d"] = np.where(
-    pagados["flag_0_10d"] == 1,
-    pagados[monto_col].fillna(0),
-    0
-)
+# Marcar primeros 10 días
+pagados["flag_0_10d"] = pagados["DIF_VIGENCIA"].notna() & (pagados["DIF_VIGENCIA"] <= 10)
+pagados["monto_aux"] = pagados[monto_col].fillna(0)
+pagados["monto_0_10d"] = np.where(pagados["flag_0_10d"], pagados["monto_aux"], 0)
 
 # Resumen por AGRUPACION_QS
 resumen_10d_qs = (
-    pagados.groupby("AGRUPACION_QS")
+    pagados
+    .groupby("AGRUPACION_QS", dropna=False)
     .agg(
         n_pagados_total=("AGRUPACION_QS", "size"),
         n_pagados_0_10d=("flag_0_10d", "sum"),
-        monto_total_pagados=(monto_col, lambda x: x.fillna(0).sum()),
+        monto_total_pagados=("monto_aux", "sum"),
         monto_0_10d=("monto_0_10d", "sum")
     )
     .reset_index()
@@ -1108,9 +1105,6 @@ resumen_10d_qs["pct_monto_0_10d"] = np.where(
     np.nan
 )
 
-resumen_10d_qs = resumen_10d_qs.sort_values("n_pagados_total", ascending=False)
+resumen_10d_qs = resumen_10d_qs.sort_values(["n_pagados_total"], ascending=False)
 
 display(resumen_10d_qs)
-
-# Si quieres ver solo los más grandes
-display(resumen_10d_qs.head(20))
