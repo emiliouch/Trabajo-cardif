@@ -1108,3 +1108,585 @@ resumen_10d_qs["pct_monto_0_10d"] = np.where(
 resumen_10d_qs = resumen_10d_qs.sort_values(["n_pagados_total"], ascending=False)
 
 display(resumen_10d_qs)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# 8) PERFIL DE SOSPECHA DENTRO DE FALABELLA POST-SEP2024
+# Objetivo:
+# explicar qué características distinguen a los sospechosos
+# (SOSPECHA_FINAL >= 2) dentro del segmento anómalo
+# ============================================================
+
+print_section("8) PERFIL DE SOSPECHA EN FALABELLA POST-SEP2024")
+
+# -----------------------------
+# 8.1 Universo de análisis
+# -----------------------------
+fal_df = df.copy()
+
+if "AGRUPACION_QS" not in fal_df.columns:
+    raise ValueError("No encuentro AGRUPACION_QS para filtrar Falabella.")
+
+safe_upper_col(fal_df, "AGRUPACION_QS")
+
+fal_df = fal_df[
+    (fal_df["AGRUPACION_QS"] == "FALABELLA") &
+    (fal_df["FEC_OCURRENCIA_FINAL"] >= BREAK_DATE)
+].copy()
+
+if fal_df.empty:
+    raise ValueError("No hay registros de Falabella post-septiembre 2024.")
+
+# Target nuevo
+fal_df["y_sus"] = (fal_df["SOSPECHA_FINAL"].fillna(0) >= 2).astype(int)
+
+print("Shape universo Falabella post-break:", fal_df.shape)
+print("Tasa sospechosos (y_sus):", round(fal_df["y_sus"].mean(), 4))
+display(fal_df.head(3))
+
+# -----------------------------
+# 8.2 Features derivadas nuevas
+# -----------------------------
+print_section("8.2) FEATURES DERIVADAS NUEVAS")
+
+# Numéricos seguros
+for c in [
+    "DIF_VIGENCIA", "USO_TOPE", "COUNT_OF_NUMERO_FINAL", "CUENTA_SIN_FAMILIAR_AUX",
+    "N_SEG_12M_PRE_OCURR", "N_SIN_OTRAS_COB", "MONTO_FINAL_UF", "EDAD_AL_SINIESTRO"
+]:
+    if c in fal_df.columns:
+        fal_df[c] = pd.to_numeric(fal_df[c], errors="coerce")
+
+# 1) Interacciones simples
+if {"DIF_VIGENCIA", "USO_TOPE"}.issubset(fal_df.columns):
+    fal_df["INTER_DIFXTOPE"] = fal_df["DIF_VIGENCIA"] * fal_df["USO_TOPE"]
+
+if {"COUNT_OF_NUMERO_FINAL", "CUENTA_SIN_FAMILIAR_AUX"}.issubset(fal_df.columns):
+    fal_df["INTER_REPEAT_FAM"] = fal_df["COUNT_OF_NUMERO_FINAL"].fillna(0) * fal_df["CUENTA_SIN_FAMILIAR_AUX"].fillna(0)
+
+if {"N_SEG_12M_PRE_OCURR", "N_SIN_OTRAS_COB"}.issubset(fal_df.columns):
+    fal_df["INTER_MULTI_CROSS"] = fal_df["N_SEG_12M_PRE_OCURR"].fillna(0) * fal_df["N_SIN_OTRAS_COB"].fillna(0)
+
+# 2) Buckets operativos de DIF_VIGENCIA
+if "DIF_VIGENCIA" in fal_df.columns:
+    fal_df["FLAG_0_10D"] = ((fal_df["DIF_VIGENCIA"] >= 0) & (fal_df["DIF_VIGENCIA"] <= 10)).astype(int)
+    fal_df["FLAG_11_30D"] = ((fal_df["DIF_VIGENCIA"] >= 11) & (fal_df["DIF_VIGENCIA"] <= 30)).astype(int)
+    fal_df["FLAG_31_45D"] = ((fal_df["DIF_VIGENCIA"] >= 31) & (fal_df["DIF_VIGENCIA"] <= 45)).astype(int)
+    fal_df["FLAG_46_60D"] = ((fal_df["DIF_VIGENCIA"] >= 46) & (fal_df["DIF_VIGENCIA"] <= 60)).astype(int)
+    fal_df["FLAG_0_30D"] = ((fal_df["DIF_VIGENCIA"] >= 0) & (fal_df["DIF_VIGENCIA"] <= 30)).astype(int)
+    fal_df["FLAG_0_45D"] = ((fal_df["DIF_VIGENCIA"] >= 0) & (fal_df["DIF_VIGENCIA"] <= 45)).astype(int)
+
+# 3) Buckets operativos de USO_TOPE
+if "USO_TOPE" in fal_df.columns:
+    fal_df["FLAG_TOPE_70_79"] = ((fal_df["USO_TOPE"] >= 0.70) & (fal_df["USO_TOPE"] < 0.80)).astype(int)
+    fal_df["FLAG_TOPE_80_89"] = ((fal_df["USO_TOPE"] >= 0.80) & (fal_df["USO_TOPE"] < 0.90)).astype(int)
+    fal_df["FLAG_TOPE_90P"] = (fal_df["USO_TOPE"] >= 0.90).astype(int)
+
+# 4) Flags compuestos más agresivos
+flag_inputs = [c for c in [
+    "FLAG_EVASION_DIF31_45", "FLAG_EVASION_TOPE_75_80",
+    "FLAG_MULTI_SEGURO", "FLAG_SIN_CRUZADA"
+] if c in fal_df.columns]
+
+for c in flag_inputs:
+    fal_df[c] = pd.to_numeric(fal_df[c], errors="coerce").fillna(0).astype(int)
+
+if {"FLAG_EVASION_DIF31_45", "FLAG_EVASION_TOPE_75_80"}.issubset(fal_df.columns):
+    fal_df["FLAG_EVASION_SOFT"] = (
+        (fal_df["FLAG_EVASION_DIF31_45"] == 1) |
+        (fal_df["FLAG_EVASION_TOPE_75_80"] == 1)
+    ).astype(int)
+
+if {"FLAG_MULTI_SEGURO", "FLAG_SIN_CRUZADA"}.issubset(fal_df.columns):
+    fal_df["FLAG_COMPLEJIDAD_OPERATIVA"] = (
+        (fal_df["FLAG_MULTI_SEGURO"] == 1) |
+        (fal_df["FLAG_SIN_CRUZADA"] == 1)
+    ).astype(int)
+
+if {"FLAG_EVASION_SOFT", "FLAG_COMPLEJIDAD_OPERATIVA"}.issubset(fal_df.columns):
+    fal_df["FLAG_EVASION_Y_COMPLEJIDAD"] = (
+        (fal_df["FLAG_EVASION_SOFT"] == 1) &
+        (fal_df["FLAG_COMPLEJIDAD_OPERATIVA"] == 1)
+    ).astype(int)
+
+# 5) Rareza categórica dentro de Falabella post-break
+def add_frequency_features_local(data, cols):
+    out = data.copy()
+    for c in cols:
+        if c in out.columns:
+            freq = (
+                out[c]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .value_counts(normalize=True)
+            )
+            out[f"{c}__freq_fal_post"] = (
+                out[c]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .map(freq)
+                .fillna(0)
+            )
+            out[f"{c}__rare_fal_post"] = 1 - out[f"{c}__freq_fal_post"]
+    return out
+
+freq_cols = [c for c in [
+    "COMUNA_PER", "CANAL_VENTA_SEG", "SUCURSAL_VENTA_SEG",
+    "MEDIO_PAGO_SEG", "PLAN_AUX", "COB", "GLOSA_GIRO_PER",
+    "FRECUENCIA_PAGO"
+] if c in fal_df.columns]
+
+fal_df = add_frequency_features_local(fal_df, freq_cols)
+
+# 6) Clusters operativos específicos del segmento
+if {"COMUNA_PER", "SUCURSAL_VENTA_SEG"}.issubset(fal_df.columns):
+    fal_df["cluster_comuna_sucursal"] = fal_df["COMUNA_PER"] + "|" + fal_df["SUCURSAL_VENTA_SEG"]
+
+if {"COMUNA_PER", "MEDIO_PAGO_SEG"}.issubset(fal_df.columns):
+    fal_df["cluster_comuna_medio"] = fal_df["COMUNA_PER"] + "|" + fal_df["MEDIO_PAGO_SEG"]
+
+if {"PLAN_AUX", "COB"}.issubset(fal_df.columns):
+    fal_df["cluster_plan_cob"] = fal_df["PLAN_AUX"] + "|" + fal_df["COB"]
+
+if {"CANAL_VENTA_SEG", "MEDIO_PAGO_SEG"}.issubset(fal_df.columns):
+    fal_df["cluster_canal_pago"] = fal_df["CANAL_VENTA_SEG"] + "|" + fal_df["MEDIO_PAGO_SEG"]
+
+print("Columnas disponibles después de feature engineering:", fal_df.shape[1])
+
+# -----------------------------
+# 8.3 Modelaje supervisado: sospecha en Falabella post-break
+# -----------------------------
+print_section("8.3) MODELOS SUPERVISADOS DE SOSPECHA")
+
+y_sus = fal_df["y_sus"].astype(int)
+
+# Variables históricas mínimas
+sus_old_num = [c for c in [
+    "DIF_VIGENCIA",
+    "COUNT_OF_NUMERO_FINAL",
+    "CUENTA_SIN_FAMILIAR_AUX",
+    "USO_TOPE"
+] if c in fal_df.columns]
+
+# Variables nuevas derivadas / enriquecidas
+sus_new_num = [c for c in [
+    "EDAD_AL_SINIESTRO",
+    "N_SEG_12M_PRE_OCURR",
+    "N_SIN_OTRAS_COB",
+    "MONTO_FINAL_UF",
+    "FLAG_FIN_SEMANA",
+    "FLAG_MULTI_SEGURO",
+    "FLAG_SIN_CRUZADA",
+    "FLAG_EVASION_DIF31_45",
+    "FLAG_EVASION_TOPE_75_80",
+    "FLAG_0_10D",
+    "FLAG_11_30D",
+    "FLAG_31_45D",
+    "FLAG_46_60D",
+    "FLAG_0_30D",
+    "FLAG_0_45D",
+    "FLAG_TOPE_70_79",
+    "FLAG_TOPE_80_89",
+    "FLAG_TOPE_90P",
+    "FLAG_EVASION_SOFT",
+    "FLAG_COMPLEJIDAD_OPERATIVA",
+    "FLAG_EVASION_Y_COMPLEJIDAD",
+    "INTER_DIFXTOPE",
+    "INTER_REPEAT_FAM",
+    "INTER_MULTI_CROSS"
+] if c in fal_df.columns]
+
+sus_new_freq = [c for c in fal_df.columns if c.endswith("__freq_fal_post") or c.endswith("__rare_fal_post")]
+
+sus_new_cat = [c for c in [
+    "COMUNA_PER",
+    "CANAL_VENTA_SEG",
+    "SUCURSAL_VENTA_SEG",
+    "MEDIO_PAGO_SEG",
+    "FRECUENCIA_PAGO",
+    "PLAN_AUX",
+    "COB",
+    "GLOSA_GIRO_PER",
+    "TRAMO_DIF_VIG",
+    "TRAMO_USO_TOPE",
+    "TRAMO_EDAD",
+    "cluster_comuna_sucursal",
+    "cluster_comuna_medio",
+    "cluster_plan_cob",
+    "cluster_canal_pago"
+] if c in fal_df.columns]
+
+sus_baseline_features = sus_old_num.copy()
+sus_extended_features = sus_old_num + sus_new_num + sus_new_freq + sus_new_cat
+
+print("Features baseline sospecha:", sus_baseline_features)
+print("Features extendidas sospecha:", len(sus_extended_features))
+
+X_sus_base = fal_df[sus_baseline_features].copy()
+X_sus_ext = fal_df[sus_extended_features].copy()
+
+Xs_train_b, Xs_test_b, ys_train_b, ys_test_b = train_test_split(
+    X_sus_base, y_sus, test_size=0.3, random_state=RANDOM_STATE, stratify=y_sus
+)
+
+Xs_train_e, Xs_test_e, ys_train_e, ys_test_e = train_test_split(
+    X_sus_ext, y_sus, test_size=0.3, random_state=RANDOM_STATE, stratify=y_sus
+)
+
+# Baseline
+sus_preprocessor_base = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline([("imputer", SimpleImputer(strategy="median"))]), sus_baseline_features)
+    ],
+    remainder="drop"
+)
+
+sus_model_base = HistGradientBoostingClassifier(
+    learning_rate=0.03,
+    max_iter=500,
+    max_depth=6,
+    min_samples_leaf=20,
+    l2_regularization=1.0,
+    random_state=RANDOM_STATE
+)
+
+clf_sus_base = Pipeline([
+    ("preprocessor", sus_preprocessor_base),
+    ("model", sus_model_base)
+])
+
+sw_sus_base = compute_sample_weight(class_weight="balanced", y=ys_train_b)
+clf_sus_base.fit(Xs_train_b, ys_train_b, model__sample_weight=sw_sus_base)
+
+pred_sus_base_train = clf_sus_base.predict_proba(Xs_train_b)[:, 1]
+pred_sus_base_test = clf_sus_base.predict_proba(Xs_test_b)[:, 1]
+
+print("\n=== MODELO BASELINE SOSPECHA ===")
+print("AUC train:", round(roc_auc_score(ys_train_b, pred_sus_base_train), 4))
+print("AUC test :", round(roc_auc_score(ys_test_b, pred_sus_base_test), 4))
+print("PR-AUC train:", round(average_precision_score(ys_train_b, pred_sus_base_train), 4))
+print("PR-AUC test :", round(average_precision_score(ys_test_b, pred_sus_base_test), 4))
+
+# Extendido
+sus_num_ext = sus_old_num + sus_new_num + sus_new_freq
+sus_cat_ext = sus_new_cat.copy()
+
+sus_preprocessor_ext = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline([("imputer", SimpleImputer(strategy="median"))]), sus_num_ext),
+        ("cat", Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value="MISSING")),
+            ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
+        ]), sus_cat_ext)
+    ],
+    remainder="drop"
+)
+
+sus_model_ext = HistGradientBoostingClassifier(
+    learning_rate=0.03,
+    max_iter=500,
+    max_depth=6,
+    min_samples_leaf=20,
+    l2_regularization=1.0,
+    random_state=RANDOM_STATE
+)
+
+clf_sus_ext = Pipeline([
+    ("preprocessor", sus_preprocessor_ext),
+    ("model", sus_model_ext)
+])
+
+sw_sus_ext = compute_sample_weight(class_weight="balanced", y=ys_train_e)
+clf_sus_ext.fit(Xs_train_e, ys_train_e, model__sample_weight=sw_sus_ext)
+
+pred_sus_ext_train = clf_sus_ext.predict_proba(Xs_train_e)[:, 1]
+pred_sus_ext_test = clf_sus_ext.predict_proba(Xs_test_e)[:, 1]
+
+print("\n=== MODELO EXTENDIDO SOSPECHA ===")
+print("AUC train:", round(roc_auc_score(ys_train_e, pred_sus_ext_train), 4))
+print("AUC test :", round(roc_auc_score(ys_test_e, pred_sus_ext_test), 4))
+print("PR-AUC train:", round(average_precision_score(ys_train_e, pred_sus_ext_train), 4))
+print("PR-AUC test :", round(average_precision_score(ys_test_e, pred_sus_ext_test), 4))
+
+comparison_sus = pd.DataFrame({
+    "modelo": ["baseline_sospecha", "extendido_sospecha"],
+    "auc_test": [
+        roc_auc_score(ys_test_b, pred_sus_base_test),
+        roc_auc_score(ys_test_e, pred_sus_ext_test)
+    ],
+    "pr_auc_test": [
+        average_precision_score(ys_test_b, pred_sus_base_test),
+        average_precision_score(ys_test_e, pred_sus_ext_test)
+    ]
+})
+
+print("\n=== COMPARACIÓN MODELOS SOSPECHA ===")
+display(comparison_sus)
+comparison_sus.to_csv(os.path.join(OUT_DIR, "comparison_modelos_sospecha_falabella.csv"), index=False)
+
+# -----------------------------
+# 8.4 Importancia de variables
+# -----------------------------
+print_section("8.4) IMPORTANCIA DE VARIABLES - SOSPECHA")
+
+perm_sus = permutation_importance(
+    clf_sus_ext,
+    Xs_test_e,
+    ys_test_e,
+    n_repeats=10,
+    random_state=RANDOM_STATE,
+    scoring="average_precision"
+)
+
+perm_sus_df = pd.DataFrame({
+    "feature": sus_extended_features,
+    "importance_mean": perm_sus.importances_mean,
+    "importance_std": perm_sus.importances_std
+}).sort_values("importance_mean", ascending=False)
+
+display(perm_sus_df.head(30))
+perm_sus_df.to_csv(os.path.join(OUT_DIR, "permutation_importance_sospecha_falabella.csv"), index=False)
+
+nuevas_vs_historicas = perm_sus_df[~perm_sus_df["feature"].isin(sus_old_num)].copy()
+print("\n=== VARIABLES NUEVAS MÁS IMPORTANTES PARA SOSPECHA ===")
+display(nuevas_vs_historicas.head(20))
+nuevas_vs_historicas.to_csv(os.path.join(OUT_DIR, "variables_nuevas_sospecha_falabella.csv"), index=False)
+
+plt.figure(figsize=(10, 7))
+sns.barplot(data=nuevas_vs_historicas.head(15), y="feature", x="importance_mean")
+plt.title("Variables nuevas más importantes para explicar sospecha en Falabella post-SEP2024")
+plt.xlabel("Permutation importance (mean)")
+plt.ylabel("Variable")
+plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# 8.5 Scores sobre todo el universo Falabella post-break
+# -----------------------------
+fal_df["risk_sus_base"] = clf_sus_base.predict_proba(X_sus_base)[:, 1]
+fal_df["risk_sus_ext"] = clf_sus_ext.predict_proba(X_sus_ext)[:, 1]
+fal_df["delta_sus"] = fal_df["risk_sus_ext"] - fal_df["risk_sus_base"]
+
+print("\nDistribución delta_sus:")
+display(fal_df["delta_sus"].describe())
+
+# -----------------------------
+# 8.6 Lift tables por segmento
+# -----------------------------
+print_section("8.6) LIFT TABLES POR SEGMENTO")
+
+def suspicion_shift_table(data, col, id_col_, min_size=20, top_n=20):
+    tmp = data[data[col].notna() & (data[col] != "")].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=[col, "n_total", "n_sus", "sus_rate", "avg_risk_sus", "avg_delta_sus", "lift_vs_avg"])
+    g = tmp.groupby(col).agg(
+        n_total=(id_col_, "count"),
+        n_sus=("y_sus", "sum"),
+        sus_rate=("y_sus", "mean"),
+        avg_risk_sus=("risk_sus_ext", "mean"),
+        avg_delta_sus=("delta_sus", "mean")
+    ).reset_index()
+    g = g[g["n_total"] >= min_size].copy()
+    overall = tmp["y_sus"].mean()
+    g["lift_vs_avg"] = g["sus_rate"] / overall if overall > 0 else np.nan
+    return g.sort_values(["lift_vs_avg", "n_sus"], ascending=[False, False]).head(top_n)
+
+review_sus_cols = [c for c in [
+    "COMUNA_PER",
+    "CANAL_VENTA_SEG",
+    "SUCURSAL_VENTA_SEG",
+    "MEDIO_PAGO_SEG",
+    "PLAN_AUX",
+    "COB",
+    "GLOSA_GIRO_PER",
+    "TRAMO_DIF_VIG",
+    "TRAMO_USO_TOPE",
+    "TRAMO_EDAD",
+    "cluster_comuna_sucursal",
+    "cluster_comuna_medio",
+    "cluster_plan_cob",
+    "cluster_canal_pago"
+] if c in fal_df.columns]
+
+sus_shift_tables = {}
+for col in review_sus_cols:
+    print(f"\n=== LIFT TABLE: {col} ===")
+    sus_shift_tables[col] = suspicion_shift_table(fal_df, col, id_col_=id_col, min_size=20, top_n=20)
+    display(sus_shift_tables[col])
+    sus_shift_tables[col].to_csv(os.path.join(OUT_DIR, f"sus_shift_{col}.csv"), index=False)
+
+# -----------------------------
+# 8.7 Isolation Forest para rareza dentro de Falabella post-break
+# -----------------------------
+print_section("8.7) ISOLATION FOREST - SOSPECHA / RAREZA INTERNA")
+
+iso_sus_num = [c for c in [
+    "DIF_VIGENCIA", "COUNT_OF_NUMERO_FINAL", "CUENTA_SIN_FAMILIAR_AUX", "USO_TOPE",
+    "EDAD_AL_SINIESTRO", "N_SEG_12M_PRE_OCURR", "N_SIN_OTRAS_COB", "MONTO_FINAL_UF",
+    "FLAG_FIN_SEMANA", "FLAG_MULTI_SEGURO", "FLAG_SIN_CRUZADA",
+    "FLAG_EVASION_DIF31_45", "FLAG_EVASION_TOPE_75_80",
+    "FLAG_0_10D", "FLAG_31_45D", "FLAG_TOPE_70_79", "FLAG_EVASION_Y_COMPLEJIDAD",
+    "INTER_DIFXTOPE", "INTER_REPEAT_FAM", "INTER_MULTI_CROSS"
+] if c in fal_df.columns]
+
+iso_sus_cat = [c for c in [
+    "COMUNA_PER", "CANAL_VENTA_SEG", "SUCURSAL_VENTA_SEG", "MEDIO_PAGO_SEG",
+    "PLAN_AUX", "COB", "GLOSA_GIRO_PER",
+    "cluster_comuna_sucursal", "cluster_plan_cob", "cluster_canal_pago"
+] if c in fal_df.columns]
+
+X_if_sus = build_if_matrix(fal_df, fal_df, iso_sus_num, iso_sus_cat)
+scaler_sus = StandardScaler()
+X_if_sus_scaled = scaler_sus.fit_transform(X_if_sus)
+
+iso_sus = IsolationForest(
+    n_estimators=400,
+    contamination="auto",
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+iso_sus.fit(X_if_sus_scaled)
+
+fal_df["risk_iso_sus"] = -iso_sus.score_samples(X_if_sus_scaled)
+iso_sus_threshold = fal_df["risk_iso_sus"].quantile(0.95)
+fal_df["flag_anom_sus"] = (fal_df["risk_iso_sus"] >= iso_sus_threshold).astype(int)
+
+print("Threshold anomalía interna Falabella:", round(iso_sus_threshold, 4))
+print("Anomaly rate:", round(fal_df["flag_anom_sus"].mean(), 4))
+
+# -----------------------------
+# 8.8 Top casos sospechosos
+# -----------------------------
+print_section("8.8) TOP CASOS SOSPECHOSOS FALABELLA POST-SEP2024")
+
+fal_df["risk_sus_ext_z"] = zscore(fal_df["risk_sus_ext"])
+fal_df["delta_sus_z"] = zscore(fal_df["delta_sus"])
+fal_df["risk_iso_sus_z"] = zscore(fal_df["risk_iso_sus"])
+
+fal_df["score_sospecha_final"] = (
+    0.55 * fal_df["risk_sus_ext_z"] +
+    0.25 * fal_df["delta_sus_z"] +
+    0.20 * fal_df["risk_iso_sus_z"]
+)
+
+cols_sus_review = [c for c in [
+    id_col,
+    "FEC_OCURRENCIA_FINAL",
+    "RUT_JOIN",
+    "POLIZA_JOIN",
+    "COMUNA_PER",
+    "CANAL_VENTA_SEG",
+    "SUCURSAL_VENTA_SEG",
+    "MEDIO_PAGO_SEG",
+    "PLAN_AUX",
+    "COB",
+    "GLOSA_GIRO_PER",
+    "DIF_VIGENCIA",
+    "USO_TOPE",
+    "COUNT_OF_NUMERO_FINAL",
+    "CUENTA_SIN_FAMILIAR_AUX",
+    "N_SEG_12M_PRE_OCURR",
+    "N_SIN_OTRAS_COB",
+    "FLAG_EVASION_DIF31_45",
+    "FLAG_EVASION_TOPE_75_80",
+    "FLAG_MULTI_SEGURO",
+    "FLAG_SIN_CRUZADA",
+    "FLAG_EVASION_Y_COMPLEJIDAD",
+    "risk_sus_base",
+    "risk_sus_ext",
+    "delta_sus",
+    "risk_iso_sus",
+    "score_sospecha_final",
+    "y_sus"
+] if c in fal_df.columns]
+
+top_sus = fal_df.sort_values("score_sospecha_final", ascending=False)[cols_sus_review].head(300)
+display(top_sus.head(20))
+top_sus.to_csv(os.path.join(OUT_DIR, "top300_sospechosos_falabella_post_sep2024.csv"), index=False)
+
+# -----------------------------
+# 8.9 Comparación de sospechosos vs no sospechosos
+# -----------------------------
+print_section("8.9) PERFIL PROMEDIO: SOSPECHOSOS VS NO SOSPECHOSOS")
+
+compare_cols_sus = [c for c in [
+    "DIF_VIGENCIA", "USO_TOPE", "COUNT_OF_NUMERO_FINAL", "CUENTA_SIN_FAMILIAR_AUX",
+    "N_SEG_12M_PRE_OCURR", "N_SIN_OTRAS_COB", "MONTO_FINAL_UF", "EDAD_AL_SINIESTRO",
+    "FLAG_0_10D", "FLAG_31_45D", "FLAG_TOPE_70_79",
+    "FLAG_MULTI_SEGURO", "FLAG_SIN_CRUZADA", "FLAG_EVASION_Y_COMPLEJIDAD",
+    "INTER_DIFXTOPE", "INTER_REPEAT_FAM", "INTER_MULTI_CROSS"
+] if c in fal_df.columns]
+
+profile_sus = fal_df.groupby("y_sus")[compare_cols_sus].mean().T
+profile_sus.columns = ["NO_SOSPECHOSO", "SOSPECHOSO"]
+profile_sus["DIFF_SOS_MINUS_NO"] = profile_sus["SOSPECHOSO"] - profile_sus["NO_SOSPECHOSO"]
+
+display(profile_sus.sort_values("DIFF_SOS_MINUS_NO", ascending=False))
+profile_sus.to_csv(os.path.join(OUT_DIR, "perfil_sospechosos_vs_no_falabella.csv"))
+
+# -----------------------------
+# 8.10 Extrapolación comparativa a otros socios
+# -----------------------------
+print_section("8.10) EXTRAPOLACIÓN DEL PERFIL A OTROS SOCIOS")
+
+if "AGRUPACION_QS" in df.columns:
+    compare_all = df.copy()
+    safe_upper_col(compare_all, "AGRUPACION_QS")
+
+    for c in sus_cat_ext:
+        safe_upper_col(compare_all, c)
+
+    for c in sus_num_ext:
+        if c in compare_all.columns:
+            compare_all[c] = pd.to_numeric(compare_all[c], errors="coerce")
+
+    compare_all["score_sospecha_falabella_model"] = clf_sus_ext.predict_proba(
+        compare_all[sus_extended_features]
+    )[:, 1]
+
+    extrap = (
+        compare_all
+        .groupby("AGRUPACION_QS")
+        .agg(
+            n=(id_col, "count"),
+            avg_score=("score_sospecha_falabella_model", "mean"),
+            p90_score=("score_sospecha_falabella_model", lambda x: x.quantile(0.9)),
+            pct_top10=("score_sospecha_falabella_model", lambda x: (x >= compare_all["score_sospecha_falabella_model"].quantile(0.9)).mean())
+        )
+        .reset_index()
+        .sort_values(["avg_score", "p90_score"], ascending=False)
+    )
+
+    display(extrap.head(20))
+    extrap.to_csv(os.path.join(OUT_DIR, "extrapolacion_modelo_falabella_a_otros_socios.csv"), index=False)
+
+# -----------------------------
+# 8.11 Resumen final
+# -----------------------------
+print_section("8.11) RESUMEN NUEVO BLOQUE")
+print("1) Este bloque modela SOSPECHA_FINAL>=2 dentro de Falabella post-septiembre 2024.")
+print("2) comparison_modelos_sospecha_falabella.csv compara baseline vs extendido.")
+print("3) permutation_importance_sospecha_falabella.csv muestra qué variables explican mejor la sospecha.")
+print("4) sus_shift_*.csv muestra qué segmentos concentran mayor tasa de sospecha.")
+print("5) top300_sospechosos_falabella_post_sep2024.csv contiene los casos más representativos.")
+print("6) extrapolacion_modelo_falabella_a_otros_socios.csv permite comparar el perfil Falabella contra otros socios.")
