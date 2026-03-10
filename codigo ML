@@ -1043,12 +1043,15 @@ plt.show()
 # ============================================
 # Siniestros en los primeros 10 días
 # % sobre el total de pagados en N y en monto
+# POR AGRUPACION_QS
 # ============================================
 
 work = df.copy()
 
 # Normalización mínima
 work["DIF_VIGENCIA"] = pd.to_numeric(work["DIF_VIGENCIA"], errors="coerce")
+work["AGRUPACION_QS"] = work["AGRUPACION_QS"].fillna("").astype(str).str.strip().str.upper()
+
 if "MONTO_FINAL_UF" in work.columns:
     work["MONTO_FINAL_UF"] = pd.to_numeric(work["MONTO_FINAL_UF"], errors="coerce")
 elif "MONTO_FINAL" in work.columns:
@@ -1067,33 +1070,47 @@ else:
 
 pagados = work.loc[paid_mask].copy()
 
+# Opcional: excluir AGRUPACION_QS vacío
+pagados = pagados[pagados["AGRUPACION_QS"] != ""].copy()
+
 # Elegir columna de monto
 monto_col = "MONTO_FINAL_UF" if "MONTO_FINAL_UF" in pagados.columns else "MONTO_FINAL"
 
-# Total pagados
-n_total_pagados = len(pagados)
-monto_total_pagados = pagados[monto_col].fillna(0).sum()
+# Flag primeros 10 días
+pagados["flag_0_10d"] = np.where(
+    pagados["DIF_VIGENCIA"].notna() & (pagados["DIF_VIGENCIA"] <= 10),
+    1, 0
+)
 
-# Primeros 10 días
-pagados_10d = pagados.loc[pagados["DIF_VIGENCIA"].notna() & (pagados["DIF_VIGENCIA"] <= 10)].copy()
+# Monto de primeros 10 días
+pagados["monto_0_10d"] = np.where(
+    pagados["flag_0_10d"] == 1,
+    pagados[monto_col].fillna(0),
+    0
+)
 
-n_10d = len(pagados_10d)
-monto_10d = pagados_10d[monto_col].fillna(0).sum()
+# Resumen por AGRUPACION_QS
+resumen_10d_qs = (
+    pagados.groupby("AGRUPACION_QS")
+    .agg(
+        n_pagados_total=("AGRUPACION_QS", "size"),
+        n_pagados_0_10d=("flag_0_10d", "sum"),
+        monto_total_pagados=(monto_col, lambda x: x.fillna(0).sum()),
+        monto_0_10d=("monto_0_10d", "sum")
+    )
+    .reset_index()
+)
 
-pct_n_10d = n_10d / n_total_pagados if n_total_pagados > 0 else np.nan
-pct_monto_10d = monto_10d / monto_total_pagados if monto_total_pagados > 0 else np.nan
+resumen_10d_qs["pct_n_0_10d"] = resumen_10d_qs["n_pagados_0_10d"] / resumen_10d_qs["n_pagados_total"]
+resumen_10d_qs["pct_monto_0_10d"] = np.where(
+    resumen_10d_qs["monto_total_pagados"] > 0,
+    resumen_10d_qs["monto_0_10d"] / resumen_10d_qs["monto_total_pagados"],
+    np.nan
+)
 
-resumen_10d = pd.DataFrame({
-    "n_pagados_total": [n_total_pagados],
-    "n_pagados_0_10d": [n_10d],
-    "pct_n_0_10d": [pct_n_10d],
-    f"monto_total_pagados_{monto_col}": [monto_total_pagados],
-    f"monto_0_10d_{monto_col}": [monto_10d],
-    f"pct_monto_0_10d_{monto_col}": [pct_monto_10d]
-})
+resumen_10d_qs = resumen_10d_qs.sort_values("n_pagados_total", ascending=False)
 
-display(resumen_10d)
+display(resumen_10d_qs)
 
-print(f"Siniestros pagados en los primeros 10 días: {n_10d:,}")
-print(f"% del total de pagados en N: {pct_n_10d:.2%}")
-print(f"% del total de pagados en monto ({monto_col}): {pct_monto_10d:.2%}")
+# Si quieres ver solo los más grandes
+display(resumen_10d_qs.head(20))
