@@ -4555,11 +4555,199 @@ print("PR-AUC test segunda capa GLM :", round(average_precision_score(yh_test, p
 
 # ============================================================
 # 15.8 Score híbrido final
-# no tempranos = 0
-# tempranos = score GLM segunda capa
 # ============================================================
 print_section("15.8) SCORE HÍBRIDO GLM FINAL")
 
-hyb_glm_sub["score_hyb_glm_second"] = hyb_glm_fit.predict(
-    pd.concat([Xh_train, Xh_test], axis=0).loc[hyb_glm_sub.index.intersection(pd.concat([Xh_train, Xh_test], axis=0).index)] if False else 0
+# score segunda capa sobre todo el subuniverso temprano
+hyb_glm_all_sub = hyb_glm_sub.copy()
+
+for c in hyb_glm_num_features:
+    hyb_glm_all_sub[c] = pd.to_numeric(hyb_glm_all_sub[c], errors="coerce")
+    med = hyb_glm_train_prep[c].median()
+    hyb_glm_all_sub[c] = hyb_glm_all_sub[c].fillna(med)
+
+for c in hyb_glm_cat_features:
+    hyb_glm_all_sub[c] = hyb_glm_all_sub[c].fillna("MISSING").astype(str).str.strip().str.upper()
+    top_levels = hyb_glm_train_prep[c].value_counts().head(5).index.tolist()
+    hyb_glm_all_sub[c] = np.where(hyb_glm_all_sub[c].isin(top_levels), hyb_glm_all_sub[c], "OTROS")
+
+Xh_all_num = hyb_glm_all_sub[hyb_glm_num_features].copy()
+Xh_all_cat = pd.get_dummies(
+    hyb_glm_all_sub[hyb_glm_cat_features],
+    prefix=hyb_glm_cat_features,
+    drop_first=True,
+    dtype=float
 )
+Xh_all_cat = Xh_all_cat.reindex(columns=Xh_train_cat.columns, fill_value=0.0)
+
+Xh_all = pd.concat([Xh_all_num, Xh_all_cat], axis=1)
+Xh_all = Xh_all.apply(pd.to_numeric, errors="coerce").astype(float)
+Xh_all = Xh_all.fillna(xh_medians.reindex(Xh_all.columns, fill_value=0))
+Xh_all = sm.add_constant(Xh_all, has_constant="add")
+Xh_all = Xh_all.reindex(columns=Xh_train.columns, fill_value=0.0)
+
+hyb_glm_sub["score_hyb_glm_second"] = hyb_glm_fit.predict(Xh_all.values)
+
+# merge a universo completo
+hyb_glm_df = hyb_glm_df.merge(
+    hyb_glm_sub[[id_col, "score_hyb_glm_second"]],
+    on=id_col,
+    how="left"
+)
+
+hyb_glm_df["score_hybrid_glm"] = np.where(
+    hyb_glm_df["flag_temprano_hyb_glm"] == 1,
+    hyb_glm_df["score_hyb_glm_second"].fillna(0),
+    0
+)
+
+# regla escalonada para benchmark
+hyb_glm_df["score_rule_escalonada_glm"] = (
+    hyb_glm_df["flag_temprano_hyb_glm"] * 1.0 +
+    0.25 * pd.to_numeric(hyb_glm_df["USO_TOPE"], errors="coerce").fillna(0)
+)
+
+# ============================================================
+# 15.9 Benchmark híbrido GLM
+# ============================================================
+print_section("15.9) BENCHMARK HÍBRIDO GLM")
+
+hyb_glm_test_full = hyb_glm_df[hyb_glm_df["year_month"].isin(hyb_glm_test_months)].copy()
+
+bench_hyb_glm = {
+    "regla_dif_vigencia": -pd.to_numeric(hyb_glm_test_full["DIF_VIGENCIA"], errors="coerce").fillna(999999),
+    "regla_escalonada": hyb_glm_test_full["score_rule_escalonada_glm"],
+    "glm_estabilizado": hyb_glm_test_full["score_glm_stable"] if "score_glm_stable" in hyb_glm_test_full.columns else pd.Series(np.zeros(len(hyb_glm_test_full)), index=hyb_glm_test_full.index),
+    "score_hybrid_glm": hyb_glm_test_full["score_hybrid_glm"]
+}
+
+bench_hyb_glm_rows = []
+
+for name, scores in bench_hyb_glm.items():
+    row = {
+        "modelo": name,
+        "auc_test": roc_auc_score(hyb_glm_test_full["y_hyb_glm"], scores),
+        "pr_auc_test": average_precision_score(hyb_glm_test_full["y_hyb_glm"], scores)
+    }
+
+    for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+        k_n = max(1, int(len(hyb_glm_test_full) * frac))
+        row[f"precision_top_{int(frac*100)}pct"] = precision_at_k(
+            hyb_glm_test_full["y_hyb_glm"].reset_index(drop=True),
+            pd.Series(scores).reset_index(drop=True),
+            k_n
+        )
+
+    bench_hyb_glm_rows.append(row)
+
+benchmark_hyb_glm_df = pd.DataFrame(bench_hyb_glm_rows).sort_values(["pr_auc_test", "auc_test"], ascending=False)
+
+display(benchmark_hyb_glm_df)
+benchmark_hyb_glm_df.to_csv(os.path.join(OUT_DIR, "benchmark_hibrido_glm.csv"), index=False)
+
+# ============================================================
+# 15.10 Deciles del híbrido GLM
+# ============================================================
+print_section("15.10) DECILES HÍBRIDO GLM")
+
+hyb_glm_test_eval = hyb_glm_test_full[[id_col, "FEC_OCURRENCIA_FINAL", "y_hyb_glm", "score_hybrid_glm"]].copy()
+hyb_glm_test_eval["score_rank"] = hyb_glm_test_eval["score_hybrid_glm"].rank(method="first")
+hyb_glm_test_eval["decil_hybrid_glm"] = pd.qcut(
+    hyb_glm_test_eval["score_rank"],
+    10,
+    labels=[f"D{i}" for i in range(1, 11)]
+)
+
+hyb_glm_decil_table = (
+    hyb_glm_test_eval
+    .groupby("decil_hybrid_glm")
+    .agg(
+        n=(id_col, "count"),
+        n_sospechosos=("y_hyb_glm", "sum"),
+        tasa_sospecha=("y_hyb_glm", "mean"),
+        score_min=("score_hybrid_glm", "min"),
+        score_max=("score_hybrid_glm", "max"),
+        score_avg=("score_hybrid_glm", "mean")
+    )
+    .reset_index()
+)
+
+overall_hyb_glm_rate = hyb_glm_test_eval["y_hyb_glm"].mean()
+hyb_glm_decil_table["lift_vs_promedio"] = hyb_glm_decil_table["tasa_sospecha"] / overall_hyb_glm_rate
+
+display(hyb_glm_decil_table)
+hyb_glm_decil_table.to_csv(os.path.join(OUT_DIR, "deciles_hibrido_glm_test.csv"), index=False)
+
+# ============================================================
+# 15.11 Cobertura híbrido GLM
+# ============================================================
+print_section("15.11) COBERTURA HÍBRIDO GLM")
+
+hyb_glm_test_eval = hyb_glm_test_eval.sort_values("score_hybrid_glm", ascending=False).reset_index(drop=True)
+hyb_glm_test_eval["cum_sospechosos"] = hyb_glm_test_eval["y_hyb_glm"].cumsum()
+total_hyb_glm_sos = hyb_glm_test_eval["y_hyb_glm"].sum()
+hyb_glm_test_eval["recall_acumulado"] = hyb_glm_test_eval["cum_sospechosos"] / total_hyb_glm_sos if total_hyb_glm_sos > 0 else np.nan
+hyb_glm_test_eval["pct_revisado"] = (np.arange(len(hyb_glm_test_eval)) + 1) / len(hyb_glm_test_eval)
+
+hyb_glm_coverage_rows = []
+for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+    subset = hyb_glm_test_eval.iloc[:max(1, int(len(hyb_glm_test_eval) * frac))]
+    hyb_glm_coverage_rows.append({
+        "pct_revisado": frac,
+        "n_revisado": len(subset),
+        "precision": subset["y_hyb_glm"].mean(),
+        "recall": subset["y_hyb_glm"].sum() / total_hyb_glm_sos if total_hyb_glm_sos > 0 else np.nan
+    })
+
+hyb_glm_coverage_df = pd.DataFrame(hyb_glm_coverage_rows)
+
+display(hyb_glm_coverage_df)
+hyb_glm_coverage_df.to_csv(os.path.join(OUT_DIR, "coverage_hibrido_glm_test.csv"), index=False)
+
+# ============================================================
+# 15.12 Tramos operativos híbrido GLM
+# ============================================================
+print_section("15.12) TRAMOS OPERATIVOS HÍBRIDO GLM")
+
+p99_hg = hyb_glm_df["score_hybrid_glm"].quantile(0.99)
+p95_hg = hyb_glm_df["score_hybrid_glm"].quantile(0.95)
+p90_hg = hyb_glm_df["score_hybrid_glm"].quantile(0.90)
+
+hyb_glm_df["nivel_riesgo_hybrid_glm"] = np.select(
+    [
+        hyb_glm_df["score_hybrid_glm"] >= p99_hg,
+        hyb_glm_df["score_hybrid_glm"] >= p95_hg,
+        hyb_glm_df["score_hybrid_glm"] >= p90_hg
+    ],
+    [
+        "ALTO_RIESGO",
+        "RIESGO_MEDIO_ALTO",
+        "MONITOREO"
+    ],
+    default="BASE"
+)
+
+hyb_glm_risk_table = (
+    hyb_glm_df
+    .groupby("nivel_riesgo_hybrid_glm")
+    .agg(
+        n=(id_col, "count"),
+        tasa_sospecha=("y_hyb_glm", "mean"),
+        score_min=("score_hybrid_glm", "min"),
+        score_max=("score_hybrid_glm", "max")
+    )
+    .reset_index()
+    .sort_values("score_min", ascending=False)
+)
+
+display(hyb_glm_risk_table)
+hyb_glm_risk_table.to_csv(os.path.join(OUT_DIR, "tramos_operativos_hibrido_glm.csv"), index=False)
+
+# ============================================================
+# 15.13 Resumen final
+# ============================================================
+print_section("15.13) RESUMEN BLOQUE 15")
+print("1) Este bloque implementa un sistema híbrido usando DIF_VIGENCIA como primera capa y GLM regularizado como segunda capa.")
+print("2) benchmark_hibrido_glm.csv compara el híbrido GLM contra regla simple, regla escalonada y GLM estabilizado.")
+print("3) deciles_hibrido_glm_test.csv y coverage_hibrido_glm_test.csv miden la utilidad operativa del híbrido.")
+print("4) tramos_operativos_hibrido_glm.csv propone segmentación de riesgo para el sistema híbrido.")
