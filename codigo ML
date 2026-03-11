@@ -3651,45 +3651,64 @@ coef_rank = coef_rank.sort_values("abs_coef", ascending=False)
 display(coef_rank.head(20))
 coef_rank.to_csv(os.path.join(OUT_DIR, "glm_rank_coeficientes.csv"), index=False)
 
+
 # ============================================================
-# 13.8 Score GLM sobre todo el universo productivo
+# 15.8 Score híbrido final
 # ============================================================
-print_section("13.8) SCORE GLM SOBRE TODO EL UNIVERSO")
+print_section("15.8) SCORE HÍBRIDO GLM FINAL")
 
-glm_all = glm_df.copy()
+# score segunda capa sobre todo el subuniverso temprano
+hyb_glm_all_sub = hyb_glm_sub.copy()
 
-# mismas transformaciones que train/test
-for c in glm_num_features:
-    glm_all[c] = pd.to_numeric(glm_all[c], errors="coerce")
-    med = glm_train_prep[c].median()
-    glm_all[c] = glm_all[c].fillna(med)
+for c in hyb_glm_num_features:
+    hyb_glm_all_sub[c] = pd.to_numeric(hyb_glm_all_sub[c], errors="coerce")
+    med = hyb_glm_train_prep[c].median()
+    hyb_glm_all_sub[c] = hyb_glm_all_sub[c].fillna(med)
 
-for c in glm_cat_features:
-    glm_all[c] = glm_all[c].fillna("MISSING").astype(str).str.strip().str.upper()
-    top_levels = glm_train_prep[c].value_counts().head(10).index.tolist()
-    glm_all[c] = np.where(glm_all[c].isin(top_levels), glm_all[c], "OTROS")
+for c in hyb_glm_cat_features:
+    hyb_glm_all_sub[c] = hyb_glm_all_sub[c].fillna("MISSING").astype(str).str.strip().str.upper()
+    top_levels = hyb_glm_train_prep[c].value_counts().head(5).index.tolist()
+    hyb_glm_all_sub[c] = np.where(hyb_glm_all_sub[c].isin(top_levels), hyb_glm_all_sub[c], "OTROS")
 
-if "INTER_DIFXTOPE_GLM" in glm_num_features_glm and {"DIF_VIGENCIA", "USO_TOPE"}.issubset(glm_all.columns):
-    glm_all["INTER_DIFXTOPE_GLM"] = glm_all["DIF_VIGENCIA"] * glm_all["USO_TOPE"]
-
-X_all_num = glm_all[glm_num_features_glm].copy()
-X_all_cat = pd.get_dummies(
-    glm_all[glm_cat_features],
-    prefix=glm_cat_features,
+Xh_all_num = hyb_glm_all_sub[hyb_glm_num_features].copy()
+Xh_all_cat = pd.get_dummies(
+    hyb_glm_all_sub[hyb_glm_cat_features],
+    prefix=hyb_glm_cat_features,
     drop_first=True,
     dtype=float
 )
 
-X_all_cat = X_all_cat.reindex(columns=X_train_cat.columns, fill_value=0.0)
+Xh_all_cat = Xh_all_cat.reindex(columns=Xh_train_cat.columns, fill_value=0.0)
 
-X_all_glm = pd.concat([X_all_num, X_all_cat], axis=1)
-X_all_glm = X_all_glm.apply(pd.to_numeric, errors="coerce").astype(float)
-X_all_glm = X_all_glm.fillna(train_medians_final.reindex(X_all_glm.columns, fill_value=0))
-X_all_glm = sm.add_constant(X_all_glm, has_constant="add")
-X_all_glm = X_all_glm.reindex(columns=X_train_glm.columns, fill_value=0.0)
+Xh_all = pd.concat([Xh_all_num, Xh_all_cat], axis=1)
+Xh_all = Xh_all.apply(pd.to_numeric, errors="coerce").astype(float)
+Xh_all = Xh_all.fillna(xh_medians.reindex(Xh_all.columns, fill_value=0))
+Xh_all = sm.add_constant(Xh_all, has_constant="add")
+Xh_all = Xh_all.reindex(columns=Xh_train.columns, fill_value=0.0)
 
-glm_df["score_glm_prod"] = glm_fit.predict(X_all_glm.values)
+print("Shape Xh_all:", Xh_all.shape)
+print("Shape Xh_train:", Xh_train.shape)
 
+hyb_glm_all_sub["score_hyb_glm_second"] = hyb_glm_fit.predict(Xh_all.values)
+
+# merge a universo completo
+hyb_glm_df = hyb_glm_df.merge(
+    hyb_glm_all_sub[[id_col, "score_hyb_glm_second"]],
+    on=id_col,
+    how="left"
+)
+
+hyb_glm_df["score_hybrid_glm"] = np.where(
+    hyb_glm_df["flag_temprano_hyb_glm"] == 1,
+    hyb_glm_df["score_hyb_glm_second"].fillna(0),
+    0
+)
+
+# regla escalonada para benchmark
+hyb_glm_df["score_rule_escalonada_glm"] = (
+    hyb_glm_df["flag_temprano_hyb_glm"] * 1.0 +
+    0.25 * pd.to_numeric(hyb_glm_df["USO_TOPE"], errors="coerce").fillna(0)
+)
 # ============================================================
 # 13.9 Benchmark GLM vs regla simple vs modelo previo
 # ============================================================
