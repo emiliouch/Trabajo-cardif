@@ -4751,3 +4751,216 @@ print("1) Este bloque implementa un sistema híbrido usando DIF_VIGENCIA como pr
 print("2) benchmark_hibrido_glm.csv compara el híbrido GLM contra regla simple, regla escalonada y GLM estabilizado.")
 print("3) deciles_hibrido_glm_test.csv y coverage_hibrido_glm_test.csv miden la utilidad operativa del híbrido.")
 print("4) tramos_operativos_hibrido_glm.csv propone segmentación de riesgo para el sistema híbrido.")
+
+
+
+
+
+
+
+
+
+
+
+1. Punto de partida
+
+El problema de negocio ya estaba relativamente acotado desde el inicio: internamente ya existía la sospecha de que el aumento de la tasa de entrada estaba asociado a las pólizas de Falabella. Por lo tanto, el objetivo del estudio no era “descubrir desde cero” algo completamente nuevo, sino confirmarlo con evidencia, dimensionarlo, caracterizarlo y entender qué patrón operativo estaba empujando esa alza.
+
+Eso no fue una pérdida de tiempo. Al contrario: en este tipo de problemas, una sospecha interna no basta para tomar decisiones formales. Había que demostrar:
+	•	si efectivamente el aumento estaba concentrado ahí,
+	•	qué variables lo explicaban,
+	•	si se trataba de un fenómeno transversal o de un subsegmento específico,
+	•	y si existía una forma robusta de controlarlo.
+
+⸻
+
+2. Base analítica inicial
+
+El primer paso fue partir del pipeline SAS ya construido, que consolidaba la base de siniestros y definía una etiqueta operativa de sospecha usando cuatro condiciones:
+	•	baja diferencia entre fecha de otorgamiento y fecha de ocurrencia,
+	•	más de un siniestro por RUT,
+	•	familiar con siniestros,
+	•	uso de tope alto.
+
+Ese trabajo inicial fue clave porque convirtió una intuición de fraude en una base analítica sobre la cual se podía estudiar el problema de forma estructurada.
+
+Decisión analítica: usar esa base como punto de partida.
+Justificación: ya existía una lógica operativa validada por el equipo, por lo que era mejor profundizar sobre una definición conocida antes que inventar una nueva desde cero.
+
+⸻
+
+3. Enriquecimiento de la base
+
+Luego se enriqueció la información con variables de:
+	•	comuna y dirección,
+	•	canal, sucursal y medio de pago,
+	•	giro comercial,
+	•	cantidad de seguros recientes,
+	•	siniestros en otras coberturas,
+	•	edad al siniestro,
+	•	tramos de vigencia,
+	•	tramos de uso de tope,
+	•	flags de evasión,
+	•	indicadores de multi-seguro y siniestralidad cruzada.
+
+La lógica detrás de esto fue simple: si el alza de la tasa de entrada estaba asociada a un patrón anómalo, no bastaba con mirar solo la regla original; había que ver si el fenómeno también se concentraba en ciertos segmentos, canales o perfiles de clientes.
+
+Decisión analítica: ampliar el set de variables.
+Justificación: el objetivo no era solo confirmar la concentración en Falabella, sino entender qué rasgos específicos de esos casos estaban generando el quiebre.
+
+⸻
+
+4. Confirmación del foco del problema
+
+Con el análisis exploratorio y el notebook se confirmó que el quiebre posterior a septiembre de 2024 se concentraba efectivamente en Falabella, y más específicamente en Compra Protegida por Robo.
+
+Eso fue importante porque validó la hipótesis inicial del negocio: la sospecha que ya existía era correcta.
+El aporte del estudio fue transformarla en evidencia cuantitativa y operacional.
+
+Decisión analítica: restringir el análisis posterior a Falabella post-septiembre 2024 y luego a la cobertura específica.
+Justificación: una vez confirmado el foco del problema, seguir modelando sobre toda la cartera solo habría agregado ruido. Había que trabajar donde realmente estaba el fenómeno.
+
+⸻
+
+5. Primer aprendizaje fuerte: el driver principal era DIF_VIGENCIA
+
+En todas las etapas del estudio apareció la misma señal dominante: la diferencia entre la fecha de otorgamiento y la fecha de ocurrencia del siniestro.
+
+En el modelo de sospecha de Falabella post-septiembre 2024, las variables más importantes fueron:
+	•	DIF_VIGENCIA: 0.257
+	•	PLAN_AUX_FREQ: 0.185
+	•	EDAD_AL_SINIESTRO: 0.020
+	•	N_SEG_12M_PRE_OCURR: 0.020
+	•	FLAG_COMPLEJIDAD_OPERATIVA: 0.017
+
+Y de ahí hacia abajo, gran parte del resto de variables cayó prácticamente a cero.
+
+Eso ya mostraba algo importante: aunque enriquecimos la base con muchas variables, el fenómeno seguía estando estructuralmente dominado por la vigencia temprana.
+
+⸻
+
+6. Evidencia segmentada que explicó el alza
+
+Cuando se miraron los lifts por segmentos, el patrón se volvió todavía más claro.
+
+Por tramo de vigencia
+	•	Menor a 31 días: 161 casos, 58 sospechosos, tasa 0.36, lift 3.04
+	•	60–89 días: 74 casos, 3 sospechosos, lift 0.34
+	•	90–179 días: 170 casos, 4 sospechosos, lift 0.20
+	•	Los demás tramos prácticamente no tenían casos sospechosos
+
+Esta fue probablemente la evidencia más contundente del proyecto.
+
+Interpretación: la subida de la tasa de entrada no estaba siendo impulsada por todo Falabella por igual, sino por una concentración desproporcionada de siniestros muy tempranos tras la contratación.
+
+⸻
+
+7. Perfil complementario de los sospechosos
+
+Luego se comparó el perfil promedio de sospechosos versus no sospechosos, lo que permitió complementar la explicación.
+
+Diferencias relevantes
+	•	MONTO_FINAL_UF: 28.09 vs 20.54
+	•	N_SEG_12M_PRE_OCURR: 2.48 vs 1.91
+	•	FLAG_0_10D: 0.43 vs 0.08
+	•	CUENTA_SIN_FAMILIAR_AUX: 0.23 vs 0.04
+	•	N_SIN_OTRAS_COB: 0.31 vs 0.16
+	•	USO_TOPE: 0.44 vs 0.34
+	•	EDAD_AL_SINIESTRO: 39.97 vs 45.21
+	•	DIF_VIGENCIA: 11.37 vs 108.29
+
+Esto permitió decir algo más fino:
+
+El alza no solo estaba explicada por vigencia corta, sino por un perfil complementario de mayor intensidad operativa: montos más altos, más seguros recientes, algo más de siniestralidad cruzada y mayor presencia de vínculos familiares con siniestros.
+
+Pero aun así, la variable dominante seguía siendo DIF_VIGENCIA.
+
+⸻
+
+8. Intento de score productivo
+
+Con toda esa información se construyó un primer score productivo parsimonioso sobre el universo crítico.
+
+Métricas del score productivo
+	•	AUC train: 0.9269
+	•	AUC test: 0.8949
+	•	PR-AUC train: 0.6262
+	•	PR-AUC test: 0.4505
+
+A nivel operativo:
+	•	top 10% del universo capturaba 44.4% de los sospechosos
+	•	top 20% capturaba 77.8%
+
+Los tramos operativos también parecían potentes:
+	•	ALTO_RIESGO: 83.3%
+	•	RIESGO_MEDIO_ALTO: 68.2%
+	•	MONITOREO: 33.3%
+	•	BASE: 7.1%
+
+Decisión analítica: probar un score formal.
+Justificación: si el patrón ya estaba claramente acotado, tenía sentido evaluar si podía transformarse en una herramienta productiva de priorización.
+
+⸻
+
+9. Benchmark: el momento decisivo del estudio
+
+Después se comparó ese score contra reglas simples.
+
+Benchmark
+	•	Regla DIF_VIGENCIA: AUC 0.9175, PR-AUC 0.5077
+	•	Modelo productivo: AUC 0.8949, PR-AUC 0.4505
+	•	Regla uso tope: muy inferior
+
+Ese fue el punto de inflexión.
+
+El hallazgo fue claro:
+
+el score sí tenía señal, pero no lograba superar a una regla mucho más simple basada solo en DIF_VIGENCIA.
+
+Decisión analítica: no insistir ciegamente con el modelo puro.
+Justificación: si una regla simple supera al score, no es razonable complejizar la solución solo por querer usar machine learning.
+
+⸻
+
+10. Modelos alternativos: GLM e híbrido
+
+Se probaron después:
+	•	un GLM productivo,
+	•	un GLM estabilizado con regularización,
+	•	y un sistema híbrido con primera capa por vigencia y segunda capa con GLM.
+
+GLM estabilizado
+	•	AUC test: 0.8141
+	•	PR-AUC test: 0.3871
+
+Híbrido GLM
+	•	AUC test: 0.8223
+	•	PR-AUC test: 0.3454
+
+En ambos casos, seguían por debajo de la regla simple de DIF_VIGENCIA.
+
+Eso confirmó que el problema no era “encontrar el algoritmo correcto”, sino aceptar que la señal estructural principal ya estaba en una regla operativa muy simple.
+
+⸻
+
+11. Conclusión de negocio del estudio
+
+La conclusión central del estudio no es que “encontramos algo totalmente inesperado”, porque el negocio ya sospechaba que Falabella era el foco. La verdadera contribución fue otra:
+	1.	Confirmamos cuantitativamente que el alza de la tasa de entrada estaba concentrada en Falabella.
+	2.	Acotamos con precisión que el fenómeno se intensificaba especialmente en Compra Protegida por Robo.
+	3.	Identificamos el patrón operativo dominante: una concentración anómala de siniestros con muy baja vigencia entre contratación y ocurrencia.
+	4.	Probamos si un modelo complejo agregaba valor, y concluimos que no superaba a la regla simple dominante.
+
+Por lo tanto, la subida de la tasa de entrada posterior a la introducción de los productos de Falabella se explica, fundamentalmente, por la aparición y concentración de un subgrupo de siniestros tempranos tras la contratación, con características compatibles con comportamiento sospechoso.
+
+⸻
+
+12. Recomendación final
+
+La recomendación final no es implementar un modelo puro como mecanismo principal de control.
+
+La solución más robusta, explicable y defendible hoy es:
+	•	usar DIF_VIGENCIA como regla operativa central,
+	•	complementar con variables secundarias como uso de tope, seguros recientes, vínculos familiares y algunas variables de perfil,
+	•	y dejar los modelos como herramientas auxiliares de análisis o priorización secundaria, no como motor principal del control.
+
