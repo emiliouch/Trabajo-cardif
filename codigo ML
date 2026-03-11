@@ -2234,3 +2234,382 @@ print("1) Este bloque repite el análisis de sospecha, pero restringido a COB = 
 print("2) Sirve para ver si el perfil sospechoso dentro de Falabella se intensifica o cambia en esta cobertura específica.")
 print("3) Los outputs quedan guardados con sufijo: falabella_robo_post_sep2024.")
 print("4) extrapolacion_modelo_falabella_robo_a_otros_socios.csv compara ese perfil específico contra otros socios en la misma cobertura.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# 10) CANDIDATO DE SCORE PRODUCTIVO
+# Objetivo:
+# construir un score operativo parsimonioso, validado en el tiempo,
+# para priorizar casos sospechosos en el universo crítico
+# (Falabella + post-SEP2024 + COB = COMPRA PROTEGIDA X ROBO)
+# ============================================================
+
+print_section("10) CANDIDATO DE SCORE PRODUCTIVO")
+
+# -----------------------------
+# 10.1 Universo productivo
+# -----------------------------
+prod_df = df.copy()
+prod_df = add_suspicion_features(prod_df)
+
+safe_upper_col(prod_df, "AGRUPACION_QS")
+safe_upper_col(prod_df, "COB")
+
+prod_df = prod_df[
+    (prod_df["AGRUPACION_QS"] == "FALABELLA") &
+    (prod_df["FEC_OCURRENCIA_FINAL"] >= BREAK_DATE) &
+    (prod_df["COB"] == "COMPRA PROTEGIDA X ROBO")
+].copy()
+
+if prod_df.empty:
+    raise ValueError("No hay registros para el universo productivo.")
+
+prod_df["y_prod"] = (prod_df["SOSPECHA_FINAL"].fillna(0) >= 2).astype(int)
+prod_df["year_month"] = prod_df["FEC_OCURRENCIA_FINAL"].dt.to_period("M").astype(str)
+
+print("Shape universo productivo:", prod_df.shape)
+print("Tasa target y_prod:", round(prod_df["y_prod"].mean(), 4))
+display(prod_df.head(3))
+
+# -----------------------------
+# 10.2 Features parsimoniosas
+# -----------------------------
+prod_num_features = [c for c in [
+    "DIF_VIGENCIA",
+    "USO_TOPE",
+    "COUNT_OF_NUMERO_FINAL",
+    "CUENTA_SIN_FAMILIAR_AUX",
+    "EDAD_AL_SINIESTRO",
+    "N_SEG_12M_PRE_OCURR",
+    "N_SIN_OTRAS_COB",
+    "MONTO_FINAL_UF",
+    "FLAG_0_10D",
+    "FLAG_31_45D",
+    "FLAG_MULTI_SEGURO",
+    "FLAG_SIN_CRUZADA",
+    "INTER_MULTI_CROSS"
+] if c in prod_df.columns]
+
+prod_cat_features = [c for c in [
+    "PLAN_AUX",
+    "COMUNA_PER",
+    "MEDIO_PAGO_SEG"
+] if c in prod_df.columns]
+
+prod_features = prod_num_features + prod_cat_features
+
+print("Features productivas:")
+print(prod_features)
+
+X_prod = prod_df[prod_features].copy()
+y_prod = prod_df["y_prod"].astype(int)
+
+# -----------------------------
+# 10.3 Split temporal real
+# Últimos 3 meses con datos = test
+# -----------------------------
+unique_months = sorted(prod_df["year_month"].dropna().unique())
+
+if len(unique_months) < 6:
+    raise ValueError(
+        f"Hay muy pocos meses ({len(unique_months)}) para hacer validación temporal razonable."
+    )
+
+test_months = unique_months[-3:]
+train_months = unique_months[:-3]
+
+prod_df["is_test_time"] = prod_df["year_month"].isin(test_months).astype(int)
+
+train_mask = prod_df["is_test_time"] == 0
+test_mask = prod_df["is_test_time"] == 1
+
+X_train_prod = X_prod.loc[train_mask].copy()
+X_test_prod = X_prod.loc[test_mask].copy()
+y_train_prod = y_prod.loc[train_mask].copy()
+y_test_prod = y_prod.loc[test_mask].copy()
+
+print("Meses train:", train_months)
+print("Meses test :", test_months)
+print("Train shape:", X_train_prod.shape, "| tasa sospecha:", round(y_train_prod.mean(), 4))
+print("Test shape :", X_test_prod.shape, "| tasa sospecha:", round(y_test_prod.mean(), 4))
+
+# -----------------------------
+# 10.4 Preprocesamiento
+# -----------------------------
+prod_preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline([
+            ("imputer", SimpleImputer(strategy="median"))
+        ]), prod_num_features),
+        ("cat", Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value="MISSING")),
+            ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
+        ]), prod_cat_features)
+    ],
+    remainder="drop"
+)
+
+# -----------------------------
+# 10.5 Modelo más regularizado
+# -----------------------------
+prod_model = HistGradientBoostingClassifier(
+    learning_rate=0.03,
+    max_iter=200,
+    max_depth=3,
+    min_samples_leaf=60,
+    l2_regularization=3.0,
+    random_state=RANDOM_STATE
+)
+
+clf_prod = Pipeline([
+    ("preprocessor", prod_preprocessor),
+    ("model", prod_model)
+])
+
+sw_prod = compute_sample_weight(class_weight="balanced", y=y_train_prod)
+clf_prod.fit(X_train_prod, y_train_prod, model__sample_weight=sw_prod)
+
+pred_train_prod = clf_prod.predict_proba(X_train_prod)[:, 1]
+pred_test_prod = clf_prod.predict_proba(X_test_prod)[:, 1]
+
+print_section("10.5) MÉTRICAS DEL CANDIDATO PRODUCTIVO")
+print("AUC train:", round(roc_auc_score(y_train_prod, pred_train_prod), 4))
+print("AUC test :", round(roc_auc_score(y_test_prod, pred_test_prod), 4))
+print("PR-AUC train:", round(average_precision_score(y_train_prod, pred_train_prod), 4))
+print("PR-AUC test :", round(average_precision_score(y_test_prod, pred_test_prod), 4))
+
+# -----------------------------
+# 10.6 Importance
+# -----------------------------
+perm_prod = permutation_importance(
+    clf_prod,
+    X_test_prod,
+    y_test_prod,
+    n_repeats=10,
+    random_state=RANDOM_STATE,
+    scoring="average_precision"
+)
+
+perm_prod_df = pd.DataFrame({
+    "feature": prod_features,
+    "importance_mean": perm_prod.importances_mean,
+    "importance_std": perm_prod.importances_std
+}).sort_values("importance_mean", ascending=False)
+
+print_section("10.6) IMPORTANCIA DEL MODELO PRODUCTIVO")
+display(perm_prod_df)
+perm_prod_df.to_csv(os.path.join(OUT_DIR, "permutation_importance_modelo_productivo.csv"), index=False)
+
+# -----------------------------
+# 10.7 Score sobre todo el universo productivo
+# -----------------------------
+prod_df["score_prod"] = clf_prod.predict_proba(X_prod)[:, 1]
+
+# -----------------------------
+# 10.8 Métricas operativas: precision@k
+# -----------------------------
+print_section("10.8) MÉTRICAS OPERATIVAS DEL SCORE")
+
+for k_frac in [0.01, 0.03, 0.05, 0.10]:
+    k_n = max(1, int(len(prod_df.loc[test_mask]) * k_frac))
+    p_at_k = precision_at_k(
+        y_test_prod.reset_index(drop=True),
+        pd.Series(pred_test_prod),
+        k_n
+    )
+    print(f"precision@top_{int(k_frac*100)}% (test):", round(p_at_k, 4), f"| n={k_n}")
+
+# -----------------------------
+# 10.9 Deciles de score en test
+# -----------------------------
+test_eval = prod_df.loc[test_mask, [id_col, "FEC_OCURRENCIA_FINAL", "y_prod"]].copy()
+test_eval["score_prod"] = pred_test_prod
+
+# si hay muchos empates, qcut puede fallar; rank ayuda
+test_eval["score_rank"] = test_eval["score_prod"].rank(method="first")
+test_eval["decil_score"] = pd.qcut(test_eval["score_rank"], 10, labels=[f"D{i}" for i in range(1, 11)])
+
+decil_table = (
+    test_eval
+    .groupby("decil_score")
+    .agg(
+        n=(id_col, "count"),
+        n_sospechosos=("y_prod", "sum"),
+        tasa_sospecha=("y_prod", "mean"),
+        score_min=("score_prod", "min"),
+        score_max=("score_prod", "max"),
+        score_avg=("score_prod", "mean")
+    )
+    .reset_index()
+)
+
+overall_rate_test = test_eval["y_prod"].mean()
+decil_table["lift_vs_promedio"] = decil_table["tasa_sospecha"] / overall_rate_test
+
+print_section("10.9) DECILES DEL SCORE (TEST)")
+display(decil_table)
+decil_table.to_csv(os.path.join(OUT_DIR, "deciles_modelo_productivo_test.csv"), index=False)
+
+plt.figure(figsize=(10, 6))
+sns.barplot(data=decil_table, x="decil_score", y="tasa_sospecha")
+plt.title("Tasa de sospecha por decil de score - test temporal")
+plt.xlabel("Decil de score")
+plt.ylabel("Tasa de sospecha")
+plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# 10.10 Cobertura acumulada
+# -----------------------------
+test_eval = test_eval.sort_values("score_prod", ascending=False).reset_index(drop=True)
+test_eval["cum_sospechosos"] = test_eval["y_prod"].cumsum()
+total_sospechosos_test = test_eval["y_prod"].sum()
+test_eval["recall_acumulado"] = (
+    test_eval["cum_sospechosos"] / total_sospechosos_test if total_sospechosos_test > 0 else np.nan
+)
+test_eval["pct_revisado"] = (np.arange(len(test_eval)) + 1) / len(test_eval)
+
+coverage_points = []
+for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+    subset = test_eval.iloc[:max(1, int(len(test_eval) * frac))]
+    recall_k = subset["y_prod"].sum() / total_sospechosos_test if total_sospechosos_test > 0 else np.nan
+    precision_k = subset["y_prod"].mean()
+    coverage_points.append({
+        "pct_revisado": frac,
+        "n_revisado": len(subset),
+        "precision": precision_k,
+        "recall": recall_k
+    })
+
+coverage_df = pd.DataFrame(coverage_points)
+
+print_section("10.10) COBERTURA ACUMULADA DEL SCORE")
+display(coverage_df)
+coverage_df.to_csv(os.path.join(OUT_DIR, "coverage_modelo_productivo_test.csv"), index=False)
+
+plt.figure(figsize=(8, 5))
+plt.plot(coverage_df["pct_revisado"], coverage_df["recall"], marker="o")
+plt.title("Recall acumulado según % revisado")
+plt.xlabel("% del universo revisado")
+plt.ylabel("Recall de sospechosos")
+plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# 10.11 Propuesta preliminar de tramos operativos
+# -----------------------------
+print_section("10.11) TRAMOS OPERATIVOS PROPUESTOS")
+
+p99 = prod_df["score_prod"].quantile(0.99)
+p95 = prod_df["score_prod"].quantile(0.95)
+p90 = prod_df["score_prod"].quantile(0.90)
+
+prod_df["nivel_riesgo_prod"] = np.select(
+    [
+        prod_df["score_prod"] >= p99,
+        prod_df["score_prod"] >= p95,
+        prod_df["score_prod"] >= p90
+    ],
+    [
+        "ALTO_RIESGO",
+        "RIESGO_MEDIO_ALTO",
+        "MONITOREO"
+    ],
+    default="BASE"
+)
+
+risk_table = (
+    prod_df
+    .groupby("nivel_riesgo_prod")
+    .agg(
+        n=(id_col, "count"),
+        tasa_sospecha=("y_prod", "mean"),
+        score_min=("score_prod", "min"),
+        score_max=("score_prod", "max")
+    )
+    .reset_index()
+    .sort_values("score_min", ascending=False)
+)
+
+display(risk_table)
+risk_table.to_csv(os.path.join(OUT_DIR, "tramos_operativos_modelo_productivo.csv"), index=False)
+
+# -----------------------------
+# 10.12 Top casos productivos
+# -----------------------------
+print_section("10.12) TOP CASOS SEGÚN SCORE PRODUCTIVO")
+
+cols_prod_review = [c for c in [
+    id_col,
+    "FEC_OCURRENCIA_FINAL",
+    "RUT_JOIN",
+    "POLIZA_JOIN",
+    "PLAN_AUX",
+    "COMUNA_PER",
+    "MEDIO_PAGO_SEG",
+    "DIF_VIGENCIA",
+    "USO_TOPE",
+    "COUNT_OF_NUMERO_FINAL",
+    "CUENTA_SIN_FAMILIAR_AUX",
+    "N_SEG_12M_PRE_OCURR",
+    "N_SIN_OTRAS_COB",
+    "MONTO_FINAL_UF",
+    "EDAD_AL_SINIESTRO",
+    "FLAG_0_10D",
+    "FLAG_MULTI_SEGURO",
+    "score_prod",
+    "nivel_riesgo_prod",
+    "y_prod"
+] if c in prod_df.columns]
+
+top_prod = prod_df.sort_values("score_prod", ascending=False)[cols_prod_review].head(300)
+display(top_prod.head(20))
+top_prod.to_csv(os.path.join(OUT_DIR, "top300_score_productivo.csv"), index=False)
+
+# -----------------------------
+# 10.13 Resumen final
+# -----------------------------
+print_section("10.13) RESUMEN DEL BLOQUE PRODUCTIVO")
+print("1) Este bloque construye un score operativo parsimonioso para Falabella post-SEP2024 en COMPRA PROTEGIDA X ROBO.")
+print("2) Usa validación temporal: entrena en meses anteriores y prueba en los últimos 3 meses.")
+print("3) Prioriza utilidad operativa: precision@k, deciles, lift y recall acumulado.")
+print("4) El output principal es score_prod, no una clasificación binaria dura.")
+print("5) tramos_operativos_modelo_productivo.csv propone una primera segmentación para control formal.")
