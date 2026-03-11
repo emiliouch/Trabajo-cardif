@@ -5514,126 +5514,289 @@ Eso confirmó que el problema no era “encontrar el algoritmo correcto”, sino
 
 ⸻
 
-11. Validación final del score y decisión operativa
+11. Comparación final entre política de reglas y modelo mínimo
 
-Con el fin de evaluar si el score productivo construido realmente podía transformarse en una herramienta útil de control, se realizó una validación final en tres frentes:
-	1.	benchmark contra reglas simples,
-	2.	comparación entre el modelo completo y un modelo reducido,
-	3.	backtesting temporal mes a mes.
+Después de haber probado distintos enfoques de modelamiento —incluyendo scores productivos, GLM estabilizados y sistemas híbridos— el estudio llegó a una etapa final de contraste directo entre dos caminos posibles de implementación operativa:
+	•	una política de reglas explícitas, construida a partir de la evidencia acumulada durante el análisis;
+	•	y un modelo mínimo de machine learning (GLM), restringido a un conjunto muy pequeño de variables relevantes.
 
-Esta etapa fue importante porque permitió responder una pregunta distinta a la del resto del estudio: no solo si el modelo tenía señal, sino si esa señal era operacionalmente superior y suficientemente estable como para justificar su uso frente a reglas mucho más simples.
+La razón de realizar esta comparación final fue metodológica y práctica a la vez.
 
-11.1 Benchmark contra reglas simples
+Desde el punto de vista metodológico, ya se había observado que el fenómeno estaba fuertemente dominado por una sola variable: DIF_VIGENCIA. Eso hacía necesario verificar si un modelo estadístico agregaba valor real o si, por el contrario, estaba intentando reaprender una estructura que ya podía capturarse de forma más simple y directa mediante reglas.
 
-El primer contraste relevante fue comparar el score productivo contra reglas fáciles de implementar, particularmente una basada solo en DIF_VIGENCIA, otra basada en USO_TOPE, y una combinación simple de ambas.
+Desde el punto de vista práctico, el objetivo del proyecto no era desarrollar el modelo más sofisticado posible, sino identificar la herramienta más útil, defendible e implementable para controlar el problema observado en Falabella, particularmente en Compra Protegida por Robo.
 
-Resultados del benchmark:
-	•	Regla DIF_VIGENCIA: AUC test = 0.9175, PR-AUC test = 0.5077
-	•	Regla combinación DIF_VIGENCIA + USO_TOPE: AUC test = 0.8515, PR-AUC test = 0.4834
-	•	Modelo productivo: AUC test = 0.8949, PR-AUC test = 0.4505
-	•	Regla USO_TOPE: AUC test = 0.5528, PR-AUC test = 0.1013
-
-A nivel operativo, las precisiones en los tramos superiores del ranking fueron las siguientes:
-	•	Regla DIF_VIGENCIA:
-	•	precision top 5% = 0.60
-	•	precision top 10% = 0.545
-	•	precision top 20% = 0.318
-	•	Modelo productivo:
-	•	precision top 5% = 0.40
-	•	precision top 10% = 0.364
-	•	precision top 20% = 0.318
-
-Este resultado fue decisivo.
-Aunque el score productivo mostró capacidad de ordenamiento útil, no logró superar a la regla simple basada únicamente en DIF_VIGENCIA. Eso confirmó algo que venía insinuándose desde las etapas anteriores: el patrón dominante del fenómeno estaba tan fuertemente concentrado en la vigencia temprana que, al menos por ahora, agregar complejidad no aportaba una mejora suficiente.
-
-11.2 Comparación entre modelo completo y modelo reducido
-
-Luego se evaluó si era posible simplificar el score sin perder demasiada capacidad predictiva. Para ello se comparó el modelo productivo completo con un modelo reducido que solo conservó las variables que habían mostrado mayor señal:
+Por eso, en esta etapa final se construyó una comparación 1:1 entre:
+	•	una regla simple basada en DIF_VIGENCIA;
+	•	una política de reglas operativas más rica, que además incorporaba señales secundarias como uso de tope, familiar con siniestros, cantidad de seguros recientes y edad;
+	•	y un GLM mínimo, con solo cinco variables:
 	•	DIF_VIGENCIA
 	•	USO_TOPE
-	•	EDAD_AL_SINIESTRO
+	•	CUENTA_SIN_FAMILIAR_AUX
 	•	N_SEG_12M_PRE_OCURR
-	•	COMUNA_PER
-	•	MEDIO_PAGO_SEG
+	•	EDAD_AL_SINIESTRO
 
-Resultados:
-	•	Modelo completo
-	•	AUC train = 0.9269
-	•	AUC test = 0.8949
-	•	PR-AUC train = 0.6262
-	•	PR-AUC test = 0.4505
-	•	Modelo reducido
-	•	AUC train = 0.9254
-	•	AUC test = 0.8916
-	•	PR-AUC train = 0.6169
-	•	PR-AUC test = 0.4265
+11.1 Diseño de la comparación
 
-La pérdida de desempeño fue relativamente acotada, especialmente considerando la reducción de complejidad. En los tramos operativos superiores, además, ambos modelos mostraron comportamientos muy similares:
-	•	top 1%: ambos = 1.00
-	•	top 5%: ambos = 0.40
-	•	top 10%: ambos = 0.364
-	•	top 20%: ambos = 0.318
+La evaluación se realizó con un split temporal, lo que fue importante para evitar una validación artificialmente optimista.
+	•	Meses de entrenamiento:
+	•	2024-09 a 2025-08
+	•	Meses de prueba:
+	•	2025-11, 2025-12, 2026-01
+	•	Tamaño train:
+	•	439 registros
+	•	Tasa de sospecha en train:
+	•	12.76%
+	•	Tamaño test:
+	•	110 registros
+	•	Tasa de sospecha en test:
+	•	8.18%
 
-Esto mostró que, si se quisiera insistir con una solución modelada, sería mucho más razonable avanzar con una versión más parsimoniosa y explicable que con un modelo más cargado de variables cuya contribución marginal era baja o nula.
+Esta separación temporal fue especialmente relevante porque el problema que se estaba estudiando no era estático, sino un fenómeno que emergió y se consolidó en el tiempo. Por lo tanto, cualquier herramienta que aspirara a ser usada operativamente debía demostrar que conservaba capacidad de priorización en períodos posteriores.
 
-11.3 Backtesting temporal
+11.2 Desempeño comparado: benchmark 1:1
 
-Finalmente, se realizó un backtesting temporal para evaluar estabilidad del modelo reducido a lo largo de distintos meses de 2025.
+Los resultados de benchmark fueron concluyentes.
 
-Resultados destacados:
-	•	Enero a marzo 2025: AUC = 0.50, PR-AUC igual a la tasa base del mes
-	•	Abril a diciembre 2025: desempeño bastante mejor, con AUCs entre 0.73 y 0.95
-	•	PR-AUC más alto en junio 2025: 0.7917
-	•	PR-AUC también alto en agosto y diciembre: 0.5237 y 0.5942
+Política de reglas
+	•	AUC test:
+	•	0.9351
+	•	PR-AUC test:
+	•	0.5650
+	•	Precision top 1%:
+	•	1.0000
+	•	Precision top 3%:
+	•	0.6667
+	•	Precision top 5%:
+	•	0.6000
+	•	Precision top 10%:
+	•	0.4545
+	•	Precision top 20%:
+	•	0.3182
 
-La lectura de este ejercicio fue importante.
-El modelo no se comportó de forma homogénea en todo el período: en los primeros meses de 2025 prácticamente no discriminó, mientras que desde abril en adelante mostró una señal más clara y útil.
+Regla simple basada solo en DIF_VIGENCIA
+	•	AUC test:
+	•	0.9175
+	•	PR-AUC test:
+	•	0.5077
+	•	Precision top 1%:
+	•	0.0000
+	•	Precision top 3%:
+	•	0.6667
+	•	Precision top 5%:
+	•	0.6000
+	•	Precision top 10%:
+	•	0.5455
+	•	Precision top 20%:
+	•	0.3182
 
-Esto sugiere que el patrón sospechoso no estuvo igualmente consolidado a lo largo de todo el período, o que en los primeros meses había demasiado poco volumen o poca estructura para que el modelo pudiera capturar algo estable. En cualquier caso, este backtesting reforzó la idea de que todavía no conviene congelar un score complejo como solución final única, porque su desempeño aún depende bastante del contexto temporal.
+ML mínimo (GLM)
+	•	AUC train:
+	•	0.8219
+	•	AUC test:
+	•	0.7811
+	•	PR-AUC train:
+	•	0.3764
+	•	PR-AUC test:
+	•	0.3217
+	•	Precision top 1%:
+	•	1.0000
+	•	Precision top 3%:
+	•	0.3333
+	•	Precision top 5%:
+	•	0.2000
+	•	Precision top 10%:
+	•	0.2727
+	•	Precision top 20%:
+	•	0.1818
 
-11.4 Qué aportó esta etapa respecto de lo anterior
+11.3 Interpretación de los resultados
 
-Esta validación final mejoró el estudio en un sentido clave: permitió pasar de una lógica exploratoria a una decisión operativa más defendible.
+La comparación dejó tres conclusiones claras.
 
-Hasta antes de esta etapa, sabíamos que:
-	•	el problema estaba concentrado en Falabella,
-	•	que Compra Protegida por Robo era el foco principal,
-	•	y que DIF_VIGENCIA era el driver dominante.
+a) La política de reglas fue la mejor alternativa del estudio
+La política de reglas superó tanto al GLM mínimo como a la regla simple en el benchmark principal. En particular, logró el mejor equilibrio entre ordenamiento global (AUC) y priorización efectiva de casos sospechosos (PR-AUC).
 
-Pero todavía faltaba responder si un score formal realmente agregaba valor frente a una regla simple.
+Esto es importante porque muestra que el proyecto no terminó simplemente concluyendo que “DIF_VIGENCIA lo explica todo”, sino algo más matizado:
+	•	DIF_VIGENCIA sigue siendo la señal central;
+	•	pero una política de reglas bien diseñada, que usa esa variable como eje y la complementa con otras señales secundarias, sí logra mejorar la capacidad de priorización respecto de la regla simple.
 
-La respuesta que entregó esta última etapa fue clara:
-	•	el score sí tiene señal,
-	•	el modelo reducido es casi tan bueno como el completo,
-	•	pero ninguno supera a la regla simple basada en DIF_VIGENCIA.
+Dicho de otra manera: el resultado final no favoreció al modelo estadístico más complejo, pero tampoco se redujo a usar una sola variable aislada. La solución más fuerte fue una estructura intermedia: reglas explícitas, simples, pero informadas por toda la evidencia acumulada.
 
-Eso es una mejora respecto de lo anterior porque ya no estamos solo describiendo el fenómeno: estamos evaluando formalmente cuál herramienta conviene usar para controlarlo.
+b) El GLM mínimo no agregó valor suficiente
+Aunque el GLM mínimo fue deliberadamente parsimonioso, no logró igualar el desempeño de la política de reglas ni de la regla simple basada en DIF_VIGENCIA.
 
-En otras palabras, el avance final del estudio no consistió en encontrar un modelo más sofisticado, sino en demostrar con evidencia que, dadas las condiciones actuales, la mejor solución operacional todavía parece estar más cerca de una regla fuerte y explicable que de un modelo complejo.
+Eso tiene una implicancia fuerte: el problema no era que faltara “ajustar mejor el algoritmo”, sino que la señal dominante del fenómeno ya estaba contenida en una estructura muy simple. En ese contexto, obligar al problema a pasar por un modelo estadístico no entregó una ganancia suficiente como para justificar mayor complejidad, menor interpretabilidad y mayor dificultad de implementación.
+
+c) El problema es intensamente estructural y no principalmente algorítmico
+El bloque 16 permitió cerrar una duda que estuvo presente a lo largo de todo el estudio: si la salida correcta era seguir sofisticando modelos o aceptar que el fenómeno tenía una estructura operativa relativamente transparente.
+
+La evidencia favoreció claramente lo segundo.
+
+No se observó que un enfoque de machine learning, incluso en su versión mínima, capturara una señal superior a la política de reglas. Eso sugiere que el alza observada no depende de relaciones ocultas o muy no lineales entre muchas variables, sino de una combinación acotada de señales operativas bastante comprensibles, lideradas por la ocurrencia temprana del siniestro tras la contratación.
+
+11.4 Utilidad operativa de la política de reglas
+
+La política de reglas no solo tuvo el mejor benchmark general; también mostró una estructura operativa coherente cuando se analizó por deciles y cobertura acumulada.
+
+Deciles — política de reglas
+	•	Decil 8:
+	•	tasa de sospecha 18.18%
+	•	lift 2.22
+	•	Decil 9:
+	•	tasa de sospecha 18.18%
+	•	lift 2.22
+	•	Decil 10:
+	•	tasa de sospecha 45.45%
+	•	lift 5.56
+
+Cobertura — política de reglas
+	•	Top 1% revisado:
+	•	precision 1.0000
+	•	recall 0.1111
+	•	Top 3% revisado:
+	•	precision 0.6667
+	•	recall 0.2222
+	•	Top 5% revisado:
+	•	precision 0.6000
+	•	recall 0.3333
+	•	Top 10% revisado:
+	•	precision 0.4545
+	•	recall 0.5556
+	•	Top 20% revisado:
+	•	precision 0.3182
+	•	recall 0.7778
+
+Esto significa que, si el área operativa revisara solo el 20% superior del ranking definido por la política de reglas, capturaría alrededor del 77.8% de los casos sospechosos del período de prueba. Para fines de control, ese resultado es muy fuerte, especialmente considerando que se logra con una herramienta interpretable y fácilmente comunicable.
+
+11.5 Segmentación operativa final
+
+La política de reglas también produjo una segmentación de riesgo clara y coherente.
+
+Tramos operativos — política de reglas
+	•	ALTO_RIESGO
+	•	85 casos
+	•	tasa de sospecha 41.18%
+	•	score entre 6.0 y 8.5
+	•	RIESGO_MEDIO_ALTO
+	•	42 casos
+	•	tasa de sospecha 35.71%
+	•	score entre 4.0 y 5.75
+	•	MONITOREO
+	•	64 casos
+	•	tasa de sospecha 17.19%
+	•	score entre 2.0 y 3.75
+	•	BASE
+	•	358 casos
+	•	tasa de sospecha 1.12%
+	•	score entre 0.0 y 1.75
+
+Esta separación es muy relevante porque traduce el análisis estadístico en una herramienta utilizable por negocio. Ya no se trata solo de “predecir sospecha”, sino de definir niveles de revisión diferenciada, con riesgos claramente crecientes.
+
+11.6 Implicancias del punto 16
+
+El aporte del bloque 16 fue decisivo para cerrar la investigación. Su implicancia principal es que permitió pasar de una lógica de exploración abierta a una decisión final de implementación.
+
+En particular, el punto 16 permitió establecer que:
+	•	una política de reglas bien calibrada puede superar tanto a una regla univariada como a un modelo estadístico mínimo;
+	•	el problema observado en Falabella no requiere necesariamente una solución de machine learning para ser controlado de forma efectiva;
+	•	y, por lo tanto, la salida más defendible del estudio no es “el mejor modelo”, sino la mejor política operativa basada en evidencia.
+
+En términos prácticos, esto significa que la recomendación final del proyecto puede formularse de manera clara:
+
+el control formal del problema debiera implementarse, en una primera etapa, mediante una política de reglas operativas priorizadas, usando a DIF_VIGENCIA como eje principal y complementándola con señales secundarias como uso de tope, familiar con siniestros, cantidad de seguros recientes y edad.
 
 ⸻
 
-12. Conclusión final
+12. Conclusiones generales del proyecto
 
-El estudio permitió confirmar y acotar con evidencia un problema que ya era sospechado por el negocio, pero que no había sido todavía caracterizado con suficiente profundidad.
+El estudio permitió avanzar desde una sospecha interna relativamente bien orientada hasta una conclusión operativa defendible y sustentada cuantitativamente.
 
-Los principales hallazgos fueron los siguientes:
-	1.	El alza de la tasa de entrada posterior a septiembre de 2024 se concentró efectivamente en Falabella.
-	2.	Dentro de Falabella, el foco principal estuvo en la cobertura de Compra Protegida por Robo.
-	3.	El patrón operativo dominante fue una concentración anómala de siniestros con muy baja vigencia entre la contratación del seguro y la ocurrencia del siniestro.
-	4.	Ese patrón se complementó con un perfil de mayor intensidad operativa, caracterizado por:
-	•	montos reclamados más altos,
-	•	mayor número de seguros recientes,
+Desde el inicio, el área ya intuía que el aumento de la tasa de entrada estaba concentrado en Falabella, particularmente en Compra Protegida por Robo. Sin embargo, esa intuición debía transformarse en evidencia: había que acotar el fenómeno, entender su estructura, caracterizar a los casos involucrados y evaluar si la mejor respuesta era un modelo de scoring o una solución más simple.
+
+12.1 Hallazgos centrales del estudio
+
+A lo largo del análisis, los principales hallazgos fueron los siguientes:
+	•	El quiebre posterior a septiembre de 2024 se concentró efectivamente en Falabella.
+	•	Dentro de Falabella, el foco más claro estuvo en la cobertura Compra Protegida por Robo.
+	•	La variable más determinante de todo el estudio fue DIF_VIGENCIA.
+	•	Los casos sospechosos mostraron, además:
+	•	mayor monto reclamado,
+	•	mayor cantidad de seguros recientes,
 	•	algo más de siniestralidad cruzada,
-	•	y cierta mayor presencia de vínculos familiares con siniestros.
-	5.	A pesar de haber construido scores y modelos más complejos, la señal principal siguió estando estructuralmente dominada por DIF_VIGENCIA.
-	6.	La validación final mostró que el score productivo tiene capacidad de priorización útil, pero no supera a una regla simple basada en DIF_VIGENCIA.
+	•	mayor presencia de vínculos familiares con siniestros,
+	•	menor edad promedio.
+	•	Sin embargo, ninguna de esas variables logró desplazar a DIF_VIGENCIA como driver principal.
+	•	Los modelos más complejos —scores productivos, GLM estabilizados e híbridos— no lograron superar de forma robusta a una política de reglas bien construida.
+	•	La mejor alternativa del estudio fue una política de reglas operativas, simple pero enriquecida con señales secundarias.
 
-Por lo tanto, la conclusión final del proyecto es que la subida de la tasa de entrada en este negocio se explica fundamentalmente por la aparición y concentración de un subgrupo de siniestros muy tempranos tras la contratación, con características compatibles con comportamiento sospechoso, y que la herramienta de control más sólida y defendible en esta etapa no es todavía un modelo complejo, sino una estrategia operativa basada principalmente en reglas simples e interpretables.
+12.2 Qué explica realmente el alza observada
 
-En términos prácticos, eso significa que la mejor recomendación actual no es implementar inmediatamente un score multivariable como solución única, sino avanzar con una política de control basada en:
-	•	una regla fuerte sobre DIF_VIGENCIA,
-	•	eventualmente reforzada con variables secundarias como USO_TOPE,
-	•	y dejando los modelos parsimoniosos como apoyo complementario para priorización adicional, no como reemplazo del criterio principal.
+La investigación permite afirmar que el aumento observado en la tasa de entrada no fue un fenómeno difuso en toda la cartera ni un alza homogénea dentro de Falabella. Fue, más bien, la manifestación de un subsegmento anómalo altamente concentrado en siniestros tempranos tras la contratación.
 
-Así, el proyecto no solo permitió confirmar dónde estaba el problema, sino también cerrar una discusión mucho más relevante para el negocio: qué tipo de herramienta conviene realmente usar para enfrentarlo.
+La evidencia mostró repetidamente que:
+	•	los casos con menor DIF_VIGENCIA concentran una proporción desproporcionadamente alta de sospecha;
+	•	al abrir los tramos de vigencia, el segmento bajo 31 días aparece como el principal responsable del fenómeno;
+	•	y dentro de ese grupo se observan además señales complementarias de mayor intensidad operativa.
+
+Por eso, el proyecto no concluye que “Falabella completo” sea problemático en bloque, sino que la anomalía está asociada a un perfil específico dentro de ese negocio, cuyo rasgo dominante es la temprana ocurrencia del siniestro.
+
+12.3 Conclusión metodológica: el mejor modelo no fue el más complejo
+
+Uno de los resultados más importantes del proyecto fue metodológico.
+
+En un comienzo, la progresión natural del análisis fue hacia modelos cada vez más ricos: boosting, GLM, sistemas híbridos, segmentaciones por capas, etc. Sin embargo, al someter esas alternativas a benchmark contra reglas simples, quedó en evidencia que una mayor sofisticación no implicaba necesariamente una mejor herramienta de control.
+
+Esto tiene dos implicancias:
+	•	primero, que la señal principal del problema es tan fuerte que puede capturarse con una estructura simple;
+	•	segundo, que en este caso la interpretabilidad y la operatividad pesan más que la complejidad algorítmica.
+
+En otras palabras, el estudio no terminó validando un enfoque de machine learning como solución final, sino confirmando que la mejor respuesta era una política de reglas respaldada por evidencia analítica.
+
+12.4 Reflexión crítica sobre la variable objetivo y el posible sesgo del estudio
+
+Hay, sin embargo, una observación metodológica muy importante que debe quedar explícita, porque afecta la interpretación completa del trabajo.
+
+La variable SOSPECHA_FINAL fue construida a partir de reglas de negocio, y una de esas reglas ya incluía a DIF_VIGENCIA como componente directo de sospecha. Esto introduce un riesgo de circularidad:
+	•	si el target se define parcialmente usando DIF_VIGENCIA,
+	•	y luego se entrena o evalúa un modelo para “explicar” SOSPECHA_FINAL,
+	•	entonces es esperable que DIF_VIGENCIA aparezca como la variable más importante.
+
+Bajo esa lógica, una parte del resultado podría no estar reflejando un descubrimiento genuino del modelo, sino una consecuencia casi mecánica del modo en que fue definida la etiqueta.
+
+Este punto no invalida el estudio, pero sí obliga a interpretarlo con cuidado.
+
+Lo que sí puede afirmarse con fuerza es que:
+	•	la variable DIF_VIGENCIA está asociada al patrón anómalo observado;
+	•	y además muestra poder de priorización incluso cuando se la compara operacionalmente contra otras alternativas.
+
+Pero también es cierto que la magnitud exacta de su dominancia puede estar amplificada por la propia construcción de SOSPECHA_FINAL.
+
+Por eso, tu reflexión metodológica es correcta y debe quedar incorporada como línea futura prioritaria del proyecto:
+
+si queremos medir con mayor pureza si las nuevas variables efectivamente agregan señal de sospecha, habría que redefinir la construcción de la variable objetivo, evitando que una sola regla domine el target desde el inicio.
+
+Eso implica, en la práctica, volver al proceso SAS y rediseñar la lógica de sospecha para que:
+	•	más variables sumen señal de manera simétrica o comparable;
+	•	la etiqueta no dependa tan directamente de una sola condición dominante;
+	•	y el umbral final de sospecha se construya sobre una combinación más amplia de rasgos.
+
+Por ejemplo, una reformulación razonable sería que cada señal relevante aporte un punto o un peso comparable, y luego definir como sospechosos a quienes superen un umbral total más alto. Bajo una lógica así, el análisis permitiría responder mejor cuáles variables realmente agregan información nueva y cuáles solo replican lo que ya estaba codificado en el target.
+
+Esta observación es importante porque muestra madurez metodológica. No debilita el estudio; al contrario, fortalece su credibilidad. Señala con honestidad que el trabajo logró responder con solidez la pregunta operativa inmediata, pero que todavía existe una mejora metodológica relevante para una segunda etapa.
+
+12.5 Conclusión final del proyecto
+
+En síntesis, el proyecto permitió llegar a una respuesta clara y accionable.
+	•	Se confirmó con evidencia que el aumento de la tasa de entrada estaba concentrado en Falabella.
+	•	Se acotó el fenómeno a Compra Protegida por Robo.
+	•	Se identificó que el principal driver del problema era la ocurrencia temprana del siniestro después de la contratación.
+	•	Se mostró que, aunque existen señales complementarias de perfilamiento, ninguna desplazó a DIF_VIGENCIA como eje central.
+	•	Se probó que una política de reglas operativas supera a los enfoques de modelamiento más sofisticados evaluados en esta investigación.
+	•	Y, finalmente, se identificó una limitación metodológica importante en la construcción del target, que debiera ser abordada en una fase posterior si se quiere avanzar hacia una versión más “pura” de modelamiento predictivo.
+
+Por lo tanto, la recomendación final del estudio es la siguiente:
+
+la forma más sólida, defendible e implementable de enfrentar el problema, en su estado actual, es adoptar una política de reglas operativas basada principalmente en DIF_VIGENCIA, complementada con señales secundarias como uso de tope, familiar con siniestros, cantidad de seguros recientes y edad, y utilizarla como mecanismo formal de priorización de revisión.
+
+En paralelo, si el negocio desea desarrollar una segunda generación del sistema de control, el siguiente paso no debiera ser complejizar el algoritmo, sino redefinir cuidadosamente la etiqueta de sospecha en SAS, de modo que el modelamiento futuro no herede un sesgo estructural desde la variable objetivo.
