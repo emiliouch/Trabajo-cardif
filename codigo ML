@@ -3370,3 +3370,13 @@ print("2) Dentro del subuniverso temprano, aplica un score secundario más fino.
 print("3) benchmark_sistema_hibrido.csv compara el híbrido contra la regla simple, regla escalonada y el score previo.")
 print("4) deciles_sistema_hibrido_test.csv y coverage_sistema_hibrido_test.csv muestran utilidad operativa.")
 print("5) tramos_operativos_sistema_hibrido.csv propone una política más alineada con el fenómeno real.")
+
+
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+print("AUC normal segunda capa:", roc_auc_score(y_test_hyb, pred_test_hyb))
+print("AUC invertida segunda capa:", roc_auc_score(y_test_hyb, 1 - pred_test_hyb))
+
+print("PR-AUC normal segunda capa:", average_precision_score(y_test_hyb, pred_test_hyb))
+print("PR-AUC invertida segunda capa:", average_precision_score(y_test_hyb, 1 - pred_test_hyb))
+
