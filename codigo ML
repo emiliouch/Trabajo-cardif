@@ -2955,3 +2955,418 @@ print("2) comparacion_modelo_productivo_vs_reducido.csv compara modelo completo 
 print("3) precision_topk_completo_vs_reducido.csv compara utilidad operativa directa.")
 print("4) backtesting_temporal_modelo_reducido.csv mide estabilidad mes a mes.")
 print("5) resumen_final_modelos_candidatos.csv resume qué modelo conviene congelar preliminarmente.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# 12) SISTEMA HÍBRIDO
+# Objetivo:
+# 1) usar DIF_VIGENCIA como filtro operativo principal
+# 2) entrenar un score secundario dentro del subconjunto temprano
+# 3) comparar el sistema híbrido contra reglas simples
+# ============================================================
+
+print_section("12) SISTEMA HÍBRIDO")
+
+# ============================================================
+# 12.1 Universo base del sistema híbrido
+# ============================================================
+hyb_df = df.copy()
+hyb_df = add_suspicion_features(hyb_df)
+
+safe_upper_col(hyb_df, "AGRUPACION_QS")
+safe_upper_col(hyb_df, "COB")
+
+hyb_df = hyb_df[
+    (hyb_df["AGRUPACION_QS"] == "FALABELLA") &
+    (hyb_df["FEC_OCURRENCIA_FINAL"] >= BREAK_DATE) &
+    (hyb_df["COB"] == "COMPRA PROTEGIDA X ROBO")
+].copy()
+
+if hyb_df.empty:
+    raise ValueError("No hay registros para el sistema híbrido.")
+
+hyb_df["y_hyb"] = (hyb_df["SOSPECHA_FINAL"].fillna(0) >= 2).astype(int)
+hyb_df["year_month"] = hyb_df["FEC_OCURRENCIA_FINAL"].dt.to_period("M").astype(str)
+
+print("Shape universo híbrido:", hyb_df.shape)
+print("Tasa y_hyb:", round(hyb_df["y_hyb"].mean(), 4))
+display(hyb_df.head(3))
+
+# ============================================================
+# 12.2 Regla de primera capa
+# ============================================================
+print_section("12.2) REGLA DE PRIMERA CAPA")
+
+# Umbral operativo base
+UMBRAL_DIF_VIG = 45
+
+hyb_df["flag_temprano_hyb"] = (pd.to_numeric(hyb_df["DIF_VIGENCIA"], errors="coerce") < UMBRAL_DIF_VIG).astype(int)
+
+resumen_regla = pd.DataFrame({
+    "n_total": [len(hyb_df)],
+    "n_tempranos": [hyb_df["flag_temprano_hyb"].sum()],
+    "pct_tempranos": [hyb_df["flag_temprano_hyb"].mean()],
+    "tasa_sospecha_total": [hyb_df["y_hyb"].mean()],
+    "tasa_sospecha_tempranos": [hyb_df.loc[hyb_df["flag_temprano_hyb"] == 1, "y_hyb"].mean()],
+    "tasa_sospecha_no_tempranos": [hyb_df.loc[hyb_df["flag_temprano_hyb"] == 0, "y_hyb"].mean()]
+})
+
+display(resumen_regla)
+resumen_regla.to_csv(os.path.join(OUT_DIR, "resumen_regla_primera_capa_hibrido.csv"), index=False)
+
+# ============================================================
+# 12.3 Subuniverso de segunda capa: solo tempranos
+# ============================================================
+print_section("12.3) SUBUNIVERSO DE SEGUNDA CAPA")
+
+hyb_sub = hyb_df[hyb_df["flag_temprano_hyb"] == 1].copy()
+
+if hyb_sub.empty:
+    raise ValueError("No hay registros tempranos para construir la segunda capa.")
+
+if hyb_sub["y_hyb"].nunique() < 2:
+    raise ValueError("El subuniverso temprano no tiene variación suficiente en el target.")
+
+print("Shape subuniverso temprano:", hyb_sub.shape)
+print("Tasa sospecha en subuniverso temprano:", round(hyb_sub["y_hyb"].mean(), 4))
+
+# ============================================================
+# 12.4 Features de segunda capa
+# Excluimos DIF_VIGENCIA como driver principal porque ya se usó en capa 1
+# ============================================================
+print_section("12.4) FEATURES DE SEGUNDA CAPA")
+
+hyb_num_features = [c for c in [
+    "USO_TOPE",
+    "EDAD_AL_SINIESTRO",
+    "N_SEG_12M_PRE_OCURR",
+    "MONTO_FINAL_UF",
+    "COUNT_OF_NUMERO_FINAL",
+    "CUENTA_SIN_FAMILIAR_AUX",
+    "N_SIN_OTRAS_COB",
+    "FLAG_MULTI_SEGURO",
+    "FLAG_SIN_CRUZADA",
+    "INTER_MULTI_CROSS"
+] if c in hyb_sub.columns]
+
+hyb_cat_features = [c for c in [
+    "PLAN_AUX",
+    "COMUNA_PER",
+    "MEDIO_PAGO_SEG"
+] if c in hyb_sub.columns]
+
+hyb_features = hyb_num_features + hyb_cat_features
+
+print("Features segunda capa:")
+print(hyb_features)
+
+X_hyb = hyb_sub[hyb_features].copy()
+y_hyb = hyb_sub["y_hyb"].astype(int)
+
+# ============================================================
+# 12.5 Split temporal de segunda capa
+# ============================================================
+print_section("12.5) SPLIT TEMPORAL DE SEGUNDA CAPA")
+
+hyb_months = sorted(hyb_sub["year_month"].dropna().unique())
+
+if len(hyb_months) < 6:
+    raise ValueError(f"Hay muy pocos meses ({len(hyb_months)}) en el subuniverso temprano.")
+
+hyb_test_months = hyb_months[-3:]
+hyb_train_months = hyb_months[:-3]
+
+hyb_sub["is_test_time_hyb"] = hyb_sub["year_month"].isin(hyb_test_months).astype(int)
+
+hyb_train_mask = hyb_sub["is_test_time_hyb"] == 0
+hyb_test_mask = hyb_sub["is_test_time_hyb"] == 1
+
+X_train_hyb = X_hyb.loc[hyb_train_mask].copy()
+X_test_hyb = X_hyb.loc[hyb_test_mask].copy()
+y_train_hyb = y_hyb.loc[hyb_train_mask].copy()
+y_test_hyb = y_hyb.loc[hyb_test_mask].copy()
+
+print("Meses train segunda capa:", hyb_train_months)
+print("Meses test segunda capa :", hyb_test_months)
+print("Train shape:", X_train_hyb.shape, "| tasa sospecha:", round(y_train_hyb.mean(), 4))
+print("Test shape :", X_test_hyb.shape, "| tasa sospecha:", round(y_test_hyb.mean(), 4))
+
+# ============================================================
+# 12.6 Modelo segunda capa
+# ============================================================
+print_section("12.6) MODELO DE SEGUNDA CAPA")
+
+hyb_preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline([
+            ("imputer", SimpleImputer(strategy="median"))
+        ]), hyb_num_features),
+        ("cat", Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value="MISSING")),
+            ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
+        ]), hyb_cat_features)
+    ],
+    remainder="drop"
+)
+
+hyb_model = HistGradientBoostingClassifier(
+    learning_rate=0.03,
+    max_iter=200,
+    max_depth=3,
+    min_samples_leaf=40,
+    l2_regularization=3.0,
+    random_state=RANDOM_STATE
+)
+
+clf_hyb_second = Pipeline([
+    ("preprocessor", hyb_preprocessor),
+    ("model", hyb_model)
+])
+
+sw_hyb = compute_sample_weight(class_weight="balanced", y=y_train_hyb)
+clf_hyb_second.fit(X_train_hyb, y_train_hyb, model__sample_weight=sw_hyb)
+
+pred_train_hyb = clf_hyb_second.predict_proba(X_train_hyb)[:, 1]
+pred_test_hyb = clf_hyb_second.predict_proba(X_test_hyb)[:, 1]
+
+print("AUC train segunda capa:", round(roc_auc_score(y_train_hyb, pred_train_hyb), 4))
+print("AUC test segunda capa :", round(roc_auc_score(y_test_hyb, pred_test_hyb), 4))
+print("PR-AUC train segunda capa:", round(average_precision_score(y_train_hyb, pred_train_hyb), 4))
+print("PR-AUC test segunda capa :", round(average_precision_score(y_test_hyb, pred_test_hyb), 4))
+
+# ============================================================
+# 12.7 Score híbrido final
+# Regla + score secundario
+# ============================================================
+print_section("12.7) SCORE HÍBRIDO FINAL")
+
+# Score de segunda capa solo para tempranos
+hyb_sub["score_hyb_second"] = clf_hyb_second.predict_proba(X_hyb)[:, 1]
+
+# Merge a universo completo
+hyb_df = hyb_df.merge(
+    hyb_sub[[id_col, "score_hyb_second"]],
+    on=id_col,
+    how="left"
+)
+
+# score híbrido:
+# - no tempranos quedan en 0
+# - tempranos usan score de segunda capa
+hyb_df["score_hybrid"] = np.where(
+    hyb_df["flag_temprano_hyb"] == 1,
+    hyb_df["score_hyb_second"].fillna(0),
+    0
+)
+
+# score de regla escalonada para benchmark
+hyb_df["score_rule_escalonada"] = (
+    (hyb_df["flag_temprano_hyb"] * 1.0) +
+    0.25 * pd.to_numeric(hyb_df["USO_TOPE"], errors="coerce").fillna(0)
+)
+
+# ============================================================
+# 12.8 Benchmark del sistema híbrido
+# ============================================================
+print_section("12.8) BENCHMARK SISTEMA HÍBRIDO")
+
+hyb_test_full = hyb_df[hyb_df["year_month"].isin(hyb_test_months)].copy()
+
+bench_hybrid = {
+    "regla_dif_vigencia": -pd.to_numeric(hyb_test_full["DIF_VIGENCIA"], errors="coerce").fillna(999999),
+    "regla_escalonada": hyb_test_full["score_rule_escalonada"],
+    "score_productivo_prev": hyb_test_full["score_prod"] if "score_prod" in hyb_test_full.columns else pd.Series(np.zeros(len(hyb_test_full)), index=hyb_test_full.index),
+    "score_hybrid": hyb_test_full["score_hybrid"]
+}
+
+hybrid_benchmark_rows = []
+
+for name, scores in bench_hybrid.items():
+    row = {
+        "modelo": name,
+        "auc_test": roc_auc_score(hyb_test_full["y_hyb"], scores),
+        "pr_auc_test": average_precision_score(hyb_test_full["y_hyb"], scores)
+    }
+
+    for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+        k_n = max(1, int(len(hyb_test_full) * frac))
+        row[f"precision_top_{int(frac*100)}pct"] = precision_at_k(
+            hyb_test_full["y_hyb"].reset_index(drop=True),
+            pd.Series(scores).reset_index(drop=True),
+            k_n
+        )
+
+    hybrid_benchmark_rows.append(row)
+
+hybrid_benchmark_df = pd.DataFrame(hybrid_benchmark_rows).sort_values(["pr_auc_test", "auc_test"], ascending=False)
+
+display(hybrid_benchmark_df)
+hybrid_benchmark_df.to_csv(os.path.join(OUT_DIR, "benchmark_sistema_hibrido.csv"), index=False)
+
+# ============================================================
+# 12.9 Deciles y cobertura del sistema híbrido
+# ============================================================
+print_section("12.9) DECILES Y COBERTURA DEL SISTEMA HÍBRIDO")
+
+hyb_test_eval = hyb_test_full[[id_col, "FEC_OCURRENCIA_FINAL", "y_hyb", "score_hybrid"]].copy()
+hyb_test_eval["score_rank"] = hyb_test_eval["score_hybrid"].rank(method="first")
+hyb_test_eval["decil_score_hybrid"] = pd.qcut(hyb_test_eval["score_rank"], 10, labels=[f"D{i}" for i in range(1, 11)])
+
+hyb_decil_table = (
+    hyb_test_eval
+    .groupby("decil_score_hybrid")
+    .agg(
+        n=(id_col, "count"),
+        n_sospechosos=("y_hyb", "sum"),
+        tasa_sospecha=("y_hyb", "mean"),
+        score_min=("score_hybrid", "min"),
+        score_max=("score_hybrid", "max"),
+        score_avg=("score_hybrid", "mean")
+    )
+    .reset_index()
+)
+
+overall_rate_hyb = hyb_test_eval["y_hyb"].mean()
+hyb_decil_table["lift_vs_promedio"] = hyb_decil_table["tasa_sospecha"] / overall_rate_hyb
+
+display(hyb_decil_table)
+hyb_decil_table.to_csv(os.path.join(OUT_DIR, "deciles_sistema_hibrido_test.csv"), index=False)
+
+# cobertura acumulada
+hyb_test_eval = hyb_test_eval.sort_values("score_hybrid", ascending=False).reset_index(drop=True)
+hyb_test_eval["cum_sospechosos"] = hyb_test_eval["y_hyb"].cumsum()
+total_hyb_sos = hyb_test_eval["y_hyb"].sum()
+hyb_test_eval["recall_acumulado"] = (
+    hyb_test_eval["cum_sospechosos"] / total_hyb_sos if total_hyb_sos > 0 else np.nan
+)
+hyb_test_eval["pct_revisado"] = (np.arange(len(hyb_test_eval)) + 1) / len(hyb_test_eval)
+
+hyb_coverage_rows = []
+for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+    subset = hyb_test_eval.iloc[:max(1, int(len(hyb_test_eval) * frac))]
+    hyb_coverage_rows.append({
+        "pct_revisado": frac,
+        "n_revisado": len(subset),
+        "precision": subset["y_hyb"].mean(),
+        "recall": subset["y_hyb"].sum() / total_hyb_sos if total_hyb_sos > 0 else np.nan
+    })
+
+hyb_coverage_df = pd.DataFrame(hyb_coverage_rows)
+display(hyb_coverage_df)
+hyb_coverage_df.to_csv(os.path.join(OUT_DIR, "coverage_sistema_hibrido_test.csv"), index=False)
+
+# ============================================================
+# 12.10 Tramos operativos del sistema híbrido
+# ============================================================
+print_section("12.10) TRAMOS OPERATIVOS DEL SISTEMA HÍBRIDO")
+
+p99_h = hyb_df["score_hybrid"].quantile(0.99)
+p95_h = hyb_df["score_hybrid"].quantile(0.95)
+p90_h = hyb_df["score_hybrid"].quantile(0.90)
+
+hyb_df["nivel_riesgo_hybrid"] = np.select(
+    [
+        hyb_df["score_hybrid"] >= p99_h,
+        hyb_df["score_hybrid"] >= p95_h,
+        hyb_df["score_hybrid"] >= p90_h
+    ],
+    [
+        "ALTO_RIESGO",
+        "RIESGO_MEDIO_ALTO",
+        "MONITOREO"
+    ],
+    default="BASE"
+)
+
+hyb_risk_table = (
+    hyb_df
+    .groupby("nivel_riesgo_hybrid")
+    .agg(
+        n=(id_col, "count"),
+        tasa_sospecha=("y_hyb", "mean"),
+        score_min=("score_hybrid", "min"),
+        score_max=("score_hybrid", "max")
+    )
+    .reset_index()
+    .sort_values("score_min", ascending=False)
+)
+
+display(hyb_risk_table)
+hyb_risk_table.to_csv(os.path.join(OUT_DIR, "tramos_operativos_sistema_hibrido.csv"), index=False)
+
+# ============================================================
+# 12.11 Top casos del sistema híbrido
+# ============================================================
+print_section("12.11) TOP CASOS SISTEMA HÍBRIDO")
+
+cols_hyb_review = [c for c in [
+    id_col,
+    "FEC_OCURRENCIA_FINAL",
+    "RUT_JOIN",
+    "POLIZA_JOIN",
+    "PLAN_AUX",
+    "COMUNA_PER",
+    "MEDIO_PAGO_SEG",
+    "DIF_VIGENCIA",
+    "USO_TOPE",
+    "COUNT_OF_NUMERO_FINAL",
+    "CUENTA_SIN_FAMILIAR_AUX",
+    "N_SEG_12M_PRE_OCURR",
+    "N_SIN_OTRAS_COB",
+    "MONTO_FINAL_UF",
+    "EDAD_AL_SINIESTRO",
+    "flag_temprano_hyb",
+    "score_hyb_second",
+    "score_hybrid",
+    "nivel_riesgo_hybrid",
+    "y_hyb"
+] if c in hyb_df.columns]
+
+top_hyb = hyb_df.sort_values("score_hybrid", ascending=False)[cols_hyb_review].head(300)
+display(top_hyb.head(20))
+top_hyb.to_csv(os.path.join(OUT_DIR, "top300_sistema_hibrido.csv"), index=False)
+
+# ============================================================
+# 12.12 Resumen final
+# ============================================================
+print_section("12.12) RESUMEN BLOQUE 12")
+print("1) El sistema híbrido usa DIF_VIGENCIA como primera capa de filtrado.")
+print("2) Dentro del subuniverso temprano, aplica un score secundario más fino.")
+print("3) benchmark_sistema_hibrido.csv compara el híbrido contra la regla simple, regla escalonada y el score previo.")
+print("4) deciles_sistema_hibrido_test.csv y coverage_sistema_hibrido_test.csv muestran utilidad operativa.")
+print("5) tramos_operativos_sistema_hibrido.csv propone una política más alineada con el fenómeno real.")
