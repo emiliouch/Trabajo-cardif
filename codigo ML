@@ -4758,6 +4758,18 @@ print("4) tramos_operativos_hibrido_glm.csv propone segmentación de riesgo para
 
 
 
+Introducción
+
+El objetivo de este estudio fue analizar el aumento observado en la siniestralidad asociada a los productos de Falabella, con especial foco en la cobertura de Compra Protegida por Robo, y entender qué estaba explicando la subida de la tasa de entrada en ese negocio.
+
+Si bien desde el inicio ya existía la sospecha interna de que el problema estaba concentrado en esas pólizas, era necesario confirmarlo con evidencia, acotar el fenómeno, caracterizar el perfil de los casos involucrados y evaluar si existía una forma robusta de controlarlo.
+
+Para ello, el trabajo se desarrolló en distintas etapas: primero se utilizó la base operativa ya construida a partir del código SAS inicial, luego se enriqueció con nuevas variables de contexto y perfilamiento, después se realizaron análisis exploratorios y segmentaciones más específicas, y finalmente se probaron distintos enfoques de priorización para evaluar si un modelo aportaba valor adicional frente a reglas simples.
+
+El propósito final no fue solo detectar dónde estaba el problema, sino entender por qué se estaba produciendo el alza y determinar cuál era la forma más sólida y defendible de enfrentarla desde el punto de vista operativo.
+
+
+A continuación, se presenta el desarrollo del estudio en orden cronológico, destacando los hallazgos más relevantes de cada etapa y cómo estos fueron guiando las decisiones analíticas posteriores. El foco no estuvo solo en probar modelos, sino en entender con evidencia cuál era el origen del aumento observado y qué herramienta era realmente útil para enfrentarlo.
 
 
 DIF_VIGENCIA
