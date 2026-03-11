@@ -5514,24 +5514,126 @@ Eso confirmó que el problema no era “encontrar el algoritmo correcto”, sino
 
 ⸻
 
-11. Conclusión de negocio del estudio
+11. Validación final del score y decisión operativa
 
-La conclusión central del estudio no es que “encontramos algo totalmente inesperado”, porque el negocio ya sospechaba que Falabella era el foco. La verdadera contribución fue otra:
-	1.	Confirmamos cuantitativamente que el alza de la tasa de entrada estaba concentrada en Falabella.
-	2.	Acotamos con precisión que el fenómeno se intensificaba especialmente en Compra Protegida por Robo.
-	3.	Identificamos el patrón operativo dominante: una concentración anómala de siniestros con muy baja vigencia entre contratación y ocurrencia.
-	4.	Probamos si un modelo complejo agregaba valor, y concluimos que no superaba a la regla simple dominante.
+Con el fin de evaluar si el score productivo construido realmente podía transformarse en una herramienta útil de control, se realizó una validación final en tres frentes:
+	1.	benchmark contra reglas simples,
+	2.	comparación entre el modelo completo y un modelo reducido,
+	3.	backtesting temporal mes a mes.
 
-Por lo tanto, la subida de la tasa de entrada posterior a la introducción de los productos de Falabella se explica, fundamentalmente, por la aparición y concentración de un subgrupo de siniestros tempranos tras la contratación, con características compatibles con comportamiento sospechoso.
+Esta etapa fue importante porque permitió responder una pregunta distinta a la del resto del estudio: no solo si el modelo tenía señal, sino si esa señal era operacionalmente superior y suficientemente estable como para justificar su uso frente a reglas mucho más simples.
+
+11.1 Benchmark contra reglas simples
+
+El primer contraste relevante fue comparar el score productivo contra reglas fáciles de implementar, particularmente una basada solo en DIF_VIGENCIA, otra basada en USO_TOPE, y una combinación simple de ambas.
+
+Resultados del benchmark:
+	•	Regla DIF_VIGENCIA: AUC test = 0.9175, PR-AUC test = 0.5077
+	•	Regla combinación DIF_VIGENCIA + USO_TOPE: AUC test = 0.8515, PR-AUC test = 0.4834
+	•	Modelo productivo: AUC test = 0.8949, PR-AUC test = 0.4505
+	•	Regla USO_TOPE: AUC test = 0.5528, PR-AUC test = 0.1013
+
+A nivel operativo, las precisiones en los tramos superiores del ranking fueron las siguientes:
+	•	Regla DIF_VIGENCIA:
+	•	precision top 5% = 0.60
+	•	precision top 10% = 0.545
+	•	precision top 20% = 0.318
+	•	Modelo productivo:
+	•	precision top 5% = 0.40
+	•	precision top 10% = 0.364
+	•	precision top 20% = 0.318
+
+Este resultado fue decisivo.
+Aunque el score productivo mostró capacidad de ordenamiento útil, no logró superar a la regla simple basada únicamente en DIF_VIGENCIA. Eso confirmó algo que venía insinuándose desde las etapas anteriores: el patrón dominante del fenómeno estaba tan fuertemente concentrado en la vigencia temprana que, al menos por ahora, agregar complejidad no aportaba una mejora suficiente.
+
+11.2 Comparación entre modelo completo y modelo reducido
+
+Luego se evaluó si era posible simplificar el score sin perder demasiada capacidad predictiva. Para ello se comparó el modelo productivo completo con un modelo reducido que solo conservó las variables que habían mostrado mayor señal:
+	•	DIF_VIGENCIA
+	•	USO_TOPE
+	•	EDAD_AL_SINIESTRO
+	•	N_SEG_12M_PRE_OCURR
+	•	COMUNA_PER
+	•	MEDIO_PAGO_SEG
+
+Resultados:
+	•	Modelo completo
+	•	AUC train = 0.9269
+	•	AUC test = 0.8949
+	•	PR-AUC train = 0.6262
+	•	PR-AUC test = 0.4505
+	•	Modelo reducido
+	•	AUC train = 0.9254
+	•	AUC test = 0.8916
+	•	PR-AUC train = 0.6169
+	•	PR-AUC test = 0.4265
+
+La pérdida de desempeño fue relativamente acotada, especialmente considerando la reducción de complejidad. En los tramos operativos superiores, además, ambos modelos mostraron comportamientos muy similares:
+	•	top 1%: ambos = 1.00
+	•	top 5%: ambos = 0.40
+	•	top 10%: ambos = 0.364
+	•	top 20%: ambos = 0.318
+
+Esto mostró que, si se quisiera insistir con una solución modelada, sería mucho más razonable avanzar con una versión más parsimoniosa y explicable que con un modelo más cargado de variables cuya contribución marginal era baja o nula.
+
+11.3 Backtesting temporal
+
+Finalmente, se realizó un backtesting temporal para evaluar estabilidad del modelo reducido a lo largo de distintos meses de 2025.
+
+Resultados destacados:
+	•	Enero a marzo 2025: AUC = 0.50, PR-AUC igual a la tasa base del mes
+	•	Abril a diciembre 2025: desempeño bastante mejor, con AUCs entre 0.73 y 0.95
+	•	PR-AUC más alto en junio 2025: 0.7917
+	•	PR-AUC también alto en agosto y diciembre: 0.5237 y 0.5942
+
+La lectura de este ejercicio fue importante.
+El modelo no se comportó de forma homogénea en todo el período: en los primeros meses de 2025 prácticamente no discriminó, mientras que desde abril en adelante mostró una señal más clara y útil.
+
+Esto sugiere que el patrón sospechoso no estuvo igualmente consolidado a lo largo de todo el período, o que en los primeros meses había demasiado poco volumen o poca estructura para que el modelo pudiera capturar algo estable. En cualquier caso, este backtesting reforzó la idea de que todavía no conviene congelar un score complejo como solución final única, porque su desempeño aún depende bastante del contexto temporal.
+
+11.4 Qué aportó esta etapa respecto de lo anterior
+
+Esta validación final mejoró el estudio en un sentido clave: permitió pasar de una lógica exploratoria a una decisión operativa más defendible.
+
+Hasta antes de esta etapa, sabíamos que:
+	•	el problema estaba concentrado en Falabella,
+	•	que Compra Protegida por Robo era el foco principal,
+	•	y que DIF_VIGENCIA era el driver dominante.
+
+Pero todavía faltaba responder si un score formal realmente agregaba valor frente a una regla simple.
+
+La respuesta que entregó esta última etapa fue clara:
+	•	el score sí tiene señal,
+	•	el modelo reducido es casi tan bueno como el completo,
+	•	pero ninguno supera a la regla simple basada en DIF_VIGENCIA.
+
+Eso es una mejora respecto de lo anterior porque ya no estamos solo describiendo el fenómeno: estamos evaluando formalmente cuál herramienta conviene usar para controlarlo.
+
+En otras palabras, el avance final del estudio no consistió en encontrar un modelo más sofisticado, sino en demostrar con evidencia que, dadas las condiciones actuales, la mejor solución operacional todavía parece estar más cerca de una regla fuerte y explicable que de un modelo complejo.
 
 ⸻
 
-12. Recomendación final
+12. Conclusión final
 
-La recomendación final no es implementar un modelo puro como mecanismo principal de control.
+El estudio permitió confirmar y acotar con evidencia un problema que ya era sospechado por el negocio, pero que no había sido todavía caracterizado con suficiente profundidad.
 
-La solución más robusta, explicable y defendible hoy es:
-	•	usar DIF_VIGENCIA como regla operativa central,
-	•	complementar con variables secundarias como uso de tope, seguros recientes, vínculos familiares y algunas variables de perfil,
-	•	y dejar los modelos como herramientas auxiliares de análisis o priorización secundaria, no como motor principal del control.
+Los principales hallazgos fueron los siguientes:
+	1.	El alza de la tasa de entrada posterior a septiembre de 2024 se concentró efectivamente en Falabella.
+	2.	Dentro de Falabella, el foco principal estuvo en la cobertura de Compra Protegida por Robo.
+	3.	El patrón operativo dominante fue una concentración anómala de siniestros con muy baja vigencia entre la contratación del seguro y la ocurrencia del siniestro.
+	4.	Ese patrón se complementó con un perfil de mayor intensidad operativa, caracterizado por:
+	•	montos reclamados más altos,
+	•	mayor número de seguros recientes,
+	•	algo más de siniestralidad cruzada,
+	•	y cierta mayor presencia de vínculos familiares con siniestros.
+	5.	A pesar de haber construido scores y modelos más complejos, la señal principal siguió estando estructuralmente dominada por DIF_VIGENCIA.
+	6.	La validación final mostró que el score productivo tiene capacidad de priorización útil, pero no supera a una regla simple basada en DIF_VIGENCIA.
 
+Por lo tanto, la conclusión final del proyecto es que la subida de la tasa de entrada en este negocio se explica fundamentalmente por la aparición y concentración de un subgrupo de siniestros muy tempranos tras la contratación, con características compatibles con comportamiento sospechoso, y que la herramienta de control más sólida y defendible en esta etapa no es todavía un modelo complejo, sino una estrategia operativa basada principalmente en reglas simples e interpretables.
+
+En términos prácticos, eso significa que la mejor recomendación actual no es implementar inmediatamente un score multivariable como solución única, sino avanzar con una política de control basada en:
+	•	una regla fuerte sobre DIF_VIGENCIA,
+	•	eventualmente reforzada con variables secundarias como USO_TOPE,
+	•	y dejando los modelos parsimoniosos como apoyo complementario para priorización adicional, no como reemplazo del criterio principal.
+
+Así, el proyecto no solo permitió confirmar dónde estaba el problema, sino también cerrar una discusión mucho más relevante para el negocio: qué tipo de herramienta conviene realmente usar para enfrentarlo.
