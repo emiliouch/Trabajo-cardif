@@ -3403,12 +3403,8 @@ print("PR-AUC invertida segunda capa:", average_precision_score(y_test_hyb, 1 - 
 
 
 
-
-
-
-
 # ============================================================
-# 13) CANDIDATO PRODUCTIVO CON GLM (statsmodels)
+# 13) CANDIDATO PRODUCTIVO CON GLM (statsmodels) - BLOQUE CORREGIDO
 # Objetivo:
 # probar un enfoque más parsimonioso e interpretable usando
 # GLM Binomial sobre el universo productivo
@@ -3465,6 +3461,7 @@ glm_cat_features = [c for c in [
 ] if c in glm_df.columns]
 
 glm_features = glm_num_features + glm_cat_features
+
 print("Features GLM:")
 print(glm_features)
 
@@ -3499,6 +3496,7 @@ print("Test shape :", glm_test.shape, "| tasa sospecha:", round(glm_test["y_glm"
 # - imputación simple
 # - colapso de categorías raras
 # - dummies
+# - cast explícito a float
 # ============================================================
 print_section("13.4) MATRIZ GLM")
 
@@ -3537,35 +3535,70 @@ glm_train_prep, glm_test_prep = collapse_rare_categories(
 )
 
 # interacción explícita
+glm_num_features_glm = glm_num_features.copy()
 if {"DIF_VIGENCIA", "USO_TOPE"}.issubset(glm_train_prep.columns):
     glm_train_prep["INTER_DIFXTOPE_GLM"] = glm_train_prep["DIF_VIGENCIA"] * glm_train_prep["USO_TOPE"]
     glm_test_prep["INTER_DIFXTOPE_GLM"] = glm_test_prep["DIF_VIGENCIA"] * glm_test_prep["USO_TOPE"]
-    glm_num_features_glm = glm_num_features + ["INTER_DIFXTOPE_GLM"]
-else:
-    glm_num_features_glm = glm_num_features.copy()
+    glm_num_features_glm = glm_num_features_glm + ["INTER_DIFXTOPE_GLM"]
 
-# dummies
+# numéricas
 X_train_num = glm_train_prep[glm_num_features_glm].copy()
 X_test_num = glm_test_prep[glm_num_features_glm].copy()
 
-X_train_cat = pd.get_dummies(glm_train_prep[glm_cat_features], prefix=glm_cat_features, drop_first=True)
-X_test_cat = pd.get_dummies(glm_test_prep[glm_cat_features], prefix=glm_cat_features, drop_first=True)
+# categóricas -> dummies
+X_train_cat = pd.get_dummies(
+    glm_train_prep[glm_cat_features],
+    prefix=glm_cat_features,
+    drop_first=True,
+    dtype=float
+)
+X_test_cat = pd.get_dummies(
+    glm_test_prep[glm_cat_features],
+    prefix=glm_cat_features,
+    drop_first=True,
+    dtype=float
+)
 
-# alinear columnas entre train y test
-X_test_cat = X_test_cat.reindex(columns=X_train_cat.columns, fill_value=0)
+# alinear columnas
+X_test_cat = X_test_cat.reindex(columns=X_train_cat.columns, fill_value=0.0)
 
+# concatenar
 X_train_glm = pd.concat([X_train_num, X_train_cat], axis=1)
 X_test_glm = pd.concat([X_test_num, X_test_cat], axis=1)
+
+# forzar numérico float
+X_train_glm = X_train_glm.apply(pd.to_numeric, errors="coerce").astype(float)
+X_test_glm = X_test_glm.apply(pd.to_numeric, errors="coerce").astype(float)
+
+# imputación final por si algo quedó NaN
+train_medians_final = X_train_glm.median()
+X_train_glm = X_train_glm.fillna(train_medians_final)
+X_test_glm = X_test_glm.fillna(train_medians_final)
 
 # constante
 X_train_glm = sm.add_constant(X_train_glm, has_constant="add")
 X_test_glm = sm.add_constant(X_test_glm, has_constant="add")
 
-y_train_glm = glm_train_prep["y_glm"].astype(int)
-y_test_glm = glm_test_prep["y_glm"].astype(int)
+# alinear columnas exactas
+X_test_glm = X_test_glm.reindex(columns=X_train_glm.columns, fill_value=0.0)
+
+# target
+y_train_glm = pd.to_numeric(glm_train_prep["y_glm"], errors="coerce").fillna(0).astype(float)
+y_test_glm = pd.to_numeric(glm_test_prep["y_glm"], errors="coerce").fillna(0).astype(float)
+
+# chequeo duro
+bad_train_cols = X_train_glm.columns[X_train_glm.dtypes == "object"].tolist()
+bad_test_cols = X_test_glm.columns[X_test_glm.dtypes == "object"].tolist()
+
+if bad_train_cols or bad_test_cols:
+    raise ValueError(
+        f"Quedaron columnas object. Train: {bad_train_cols} | Test: {bad_test_cols}"
+    )
 
 print("Shape X_train_glm:", X_train_glm.shape)
 print("Shape X_test_glm :", X_test_glm.shape)
+print("Dtypes train (top):")
+display(X_train_glm.dtypes.head(20))
 
 # ============================================================
 # 13.5 Entrenamiento GLM Binomial
@@ -3573,8 +3606,8 @@ print("Shape X_test_glm :", X_test_glm.shape)
 print_section("13.5) ENTRENAMIENTO GLM")
 
 glm_bin = sm.GLM(
-    y_train_glm,
-    X_train_glm,
+    y_train_glm.values,
+    X_train_glm.values,
     family=sm.families.Binomial()
 )
 
@@ -3582,8 +3615,8 @@ glm_fit = glm_bin.fit()
 
 print(glm_fit.summary())
 
-pred_train_glm = glm_fit.predict(X_train_glm)
-pred_test_glm = glm_fit.predict(X_test_glm)
+pred_train_glm = glm_fit.predict(X_train_glm.values)
+pred_test_glm = glm_fit.predict(X_test_glm.values)
 
 print_section("13.5) MÉTRICAS GLM")
 print("AUC train:", round(roc_auc_score(y_train_glm, pred_train_glm), 4))
@@ -3597,25 +3630,21 @@ print("PR-AUC test :", round(average_precision_score(y_test_glm, pred_test_glm),
 print_section("13.6) COEFICIENTES Y ODDS RATIOS")
 
 coef_table = pd.DataFrame({
-    "feature": glm_fit.params.index,
-    "coef": glm_fit.params.values,
-    "odds_ratio": np.exp(glm_fit.params.values),
-    "p_value": glm_fit.pvalues.values
+    "feature": X_train_glm.columns,
+    "coef": glm_fit.params,
+    "odds_ratio": np.exp(glm_fit.params),
+    "p_value": glm_fit.pvalues
 }).sort_values("coef", ascending=False)
 
 display(coef_table.head(25))
 coef_table.to_csv(os.path.join(OUT_DIR, "glm_coef_odds_ratios.csv"), index=False)
 
 # ============================================================
-# 13.7 Importance proxy por magnitud estandarizada
-# (para storytelling; en GLM importan más coef y OR que "importance")
+# 13.7 Ranking de coeficientes
 # ============================================================
 print_section("13.7) RANKING DE COEFICIENTES")
 
-coef_rank = coef_table[
-    coef_table["feature"] != "const"
-].copy()
-
+coef_rank = coef_table[coef_table["feature"] != "const"].copy()
 coef_rank["abs_coef"] = coef_rank["coef"].abs()
 coef_rank = coef_rank.sort_values("abs_coef", ascending=False)
 
@@ -3640,18 +3669,26 @@ for c in glm_cat_features:
     top_levels = glm_train_prep[c].value_counts().head(10).index.tolist()
     glm_all[c] = np.where(glm_all[c].isin(top_levels), glm_all[c], "OTROS")
 
-if "INTER_DIFXTOPE_GLM" in X_train_glm.columns and {"DIF_VIGENCIA", "USO_TOPE"}.issubset(glm_all.columns):
+if "INTER_DIFXTOPE_GLM" in glm_num_features_glm and {"DIF_VIGENCIA", "USO_TOPE"}.issubset(glm_all.columns):
     glm_all["INTER_DIFXTOPE_GLM"] = glm_all["DIF_VIGENCIA"] * glm_all["USO_TOPE"]
 
 X_all_num = glm_all[glm_num_features_glm].copy()
-X_all_cat = pd.get_dummies(glm_all[glm_cat_features], prefix=glm_cat_features, drop_first=True)
-X_all_cat = X_all_cat.reindex(columns=X_train_cat.columns, fill_value=0)
+X_all_cat = pd.get_dummies(
+    glm_all[glm_cat_features],
+    prefix=glm_cat_features,
+    drop_first=True,
+    dtype=float
+)
+
+X_all_cat = X_all_cat.reindex(columns=X_train_cat.columns, fill_value=0.0)
 
 X_all_glm = pd.concat([X_all_num, X_all_cat], axis=1)
+X_all_glm = X_all_glm.apply(pd.to_numeric, errors="coerce").astype(float)
+X_all_glm = X_all_glm.fillna(train_medians_final.reindex(X_all_glm.columns, fill_value=0))
 X_all_glm = sm.add_constant(X_all_glm, has_constant="add")
-X_all_glm = X_all_glm.reindex(columns=X_train_glm.columns, fill_value=0)
+X_all_glm = X_all_glm.reindex(columns=X_train_glm.columns, fill_value=0.0)
 
-glm_df["score_glm_prod"] = glm_fit.predict(X_all_glm)
+glm_df["score_glm_prod"] = glm_fit.predict(X_all_glm.values)
 
 # ============================================================
 # 13.9 Benchmark GLM vs regla simple vs modelo previo
@@ -3660,9 +3697,8 @@ print_section("13.9) BENCHMARK GLM")
 
 glm_test_eval = glm_df.loc[glm_test_mask, [id_col, "FEC_OCURRENCIA_FINAL", "y_glm"]].copy()
 glm_test_eval["score_glm_prod"] = pred_test_glm
-glm_test_eval["score_rule_difvig"] = -pd.to_numeric(glm_test.loc[glm_test_mask, "DIF_VIGENCIA"] if False else glm_test_prep["DIF_VIGENCIA"], errors="coerce").fillna(999999).values
+glm_test_eval["score_rule_difvig"] = -pd.to_numeric(glm_test_prep["DIF_VIGENCIA"], errors="coerce").fillna(999999).values
 
-# score del modelo productivo previo si existe
 if "score_prod" in glm_df.columns:
     glm_test_eval["score_prod_prev"] = glm_df.loc[glm_test_mask, "score_prod"].values
 else:
