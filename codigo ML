@@ -4303,3 +4303,244 @@ print("1) Este bloque estabiliza el GLM con menos categorías y regularización 
 print("2) benchmark_glm_estabilizado.csv compara el GLM estabilizado contra la regla simple y los modelos previos.")
 print("3) deciles_glm_estabilizado_test.csv y coverage_glm_estabilizado_test.csv miden utilidad operativa.")
 print("4) tramos_operativos_glm_estabilizado.csv propone segmentación de riesgo más robusta.")
+
+
+
+
+
+
+
+
+# ============================================================
+# 15) SISTEMA HÍBRIDO CON GLM
+# Objetivo:
+# 1) usar DIF_VIGENCIA como primera capa
+# 2) usar GLM estabilizado como segunda capa dentro del subconjunto temprano
+# 3) comparar contra regla simple, score previo y GLM puro
+# ============================================================
+
+print_section("15) SISTEMA HÍBRIDO CON GLM")
+
+import statsmodels.api as sm
+
+# ============================================================
+# 15.1 Universo base del sistema híbrido GLM
+# ============================================================
+hyb_glm_df = df.copy()
+hyb_glm_df = add_suspicion_features(hyb_glm_df)
+
+safe_upper_col(hyb_glm_df, "AGRUPACION_QS")
+safe_upper_col(hyb_glm_df, "COB")
+
+hyb_glm_df = hyb_glm_df[
+    (hyb_glm_df["AGRUPACION_QS"] == "FALABELLA") &
+    (hyb_glm_df["FEC_OCURRENCIA_FINAL"] >= BREAK_DATE) &
+    (hyb_glm_df["COB"] == "COMPRA PROTEGIDA X ROBO")
+].copy()
+
+if hyb_glm_df.empty:
+    raise ValueError("No hay registros para el sistema híbrido con GLM.")
+
+hyb_glm_df["y_hyb_glm"] = (hyb_glm_df["SOSPECHA_FINAL"].fillna(0) >= 2).astype(int)
+hyb_glm_df["year_month"] = hyb_glm_df["FEC_OCURRENCIA_FINAL"].dt.to_period("M").astype(str)
+
+print("Shape universo híbrido GLM:", hyb_glm_df.shape)
+print("Tasa y_hyb_glm:", round(hyb_glm_df["y_hyb_glm"].mean(), 4))
+display(hyb_glm_df.head(3))
+
+# ============================================================
+# 15.2 Primera capa: regla por DIF_VIGENCIA
+# ============================================================
+print_section("15.2) PRIMERA CAPA DEL HÍBRIDO GLM")
+
+UMBRAL_DIF_VIG_GLM = 45
+
+hyb_glm_df["flag_temprano_hyb_glm"] = (
+    pd.to_numeric(hyb_glm_df["DIF_VIGENCIA"], errors="coerce") < UMBRAL_DIF_VIG_GLM
+).astype(int)
+
+resumen_hyb_glm = pd.DataFrame({
+    "n_total": [len(hyb_glm_df)],
+    "n_tempranos": [hyb_glm_df["flag_temprano_hyb_glm"].sum()],
+    "pct_tempranos": [hyb_glm_df["flag_temprano_hyb_glm"].mean()],
+    "tasa_total": [hyb_glm_df["y_hyb_glm"].mean()],
+    "tasa_tempranos": [hyb_glm_df.loc[hyb_glm_df["flag_temprano_hyb_glm"] == 1, "y_hyb_glm"].mean()],
+    "tasa_no_tempranos": [hyb_glm_df.loc[hyb_glm_df["flag_temprano_hyb_glm"] == 0, "y_hyb_glm"].mean()]
+})
+
+display(resumen_hyb_glm)
+resumen_hyb_glm.to_csv(os.path.join(OUT_DIR, "resumen_hibrido_glm_primera_capa.csv"), index=False)
+
+# ============================================================
+# 15.3 Subuniverso de segunda capa (solo tempranos)
+# ============================================================
+print_section("15.3) SUBUNIVERSO TEMPRANO PARA SEGUNDA CAPA GLM")
+
+hyb_glm_sub = hyb_glm_df[hyb_glm_df["flag_temprano_hyb_glm"] == 1].copy()
+
+if hyb_glm_sub.empty:
+    raise ValueError("No hay registros tempranos para segunda capa GLM.")
+
+if hyb_glm_sub["y_hyb_glm"].nunique() < 2:
+    raise ValueError("No hay variación suficiente del target en el subuniverso temprano.")
+
+print("Shape subuniverso temprano:", hyb_glm_sub.shape)
+print("Tasa sospecha subuniverso temprano:", round(hyb_glm_sub["y_hyb_glm"].mean(), 4))
+
+# ============================================================
+# 15.4 Features segunda capa GLM
+# Mantenemos DIF_VIGENCIA fuera porque ya gobierna capa 1
+# ============================================================
+print_section("15.4) FEATURES SEGUNDA CAPA GLM")
+
+hyb_glm_num_features = [c for c in [
+    "USO_TOPE",
+    "EDAD_AL_SINIESTRO",
+    "N_SEG_12M_PRE_OCURR",
+    "CUENTA_SIN_FAMILIAR_AUX"
+] if c in hyb_glm_sub.columns]
+
+hyb_glm_cat_features = [c for c in [
+    "PLAN_AUX",
+    "COMUNA_PER"
+] if c in hyb_glm_sub.columns]
+
+hyb_glm_features = hyb_glm_num_features + hyb_glm_cat_features
+print("Features segunda capa GLM:")
+print(hyb_glm_features)
+
+# ============================================================
+# 15.5 Split temporal de segunda capa
+# ============================================================
+print_section("15.5) SPLIT TEMPORAL SEGUNDA CAPA GLM")
+
+hyb_glm_months = sorted(hyb_glm_sub["year_month"].dropna().unique())
+if len(hyb_glm_months) < 6:
+    raise ValueError(f"Hay muy pocos meses ({len(hyb_glm_months)}) en el subuniverso temprano.")
+
+hyb_glm_test_months = hyb_glm_months[-3:]
+hyb_glm_train_months = hyb_glm_months[:-3]
+
+hyb_glm_sub["is_test_time_hyb_glm"] = hyb_glm_sub["year_month"].isin(hyb_glm_test_months).astype(int)
+
+hyb_glm_train_mask = hyb_glm_sub["is_test_time_hyb_glm"] == 0
+hyb_glm_test_mask = hyb_glm_sub["is_test_time_hyb_glm"] == 1
+
+hyb_glm_train = hyb_glm_sub.loc[hyb_glm_train_mask].copy()
+hyb_glm_test = hyb_glm_sub.loc[hyb_glm_test_mask].copy()
+
+print("Meses train segunda capa GLM:", hyb_glm_train_months)
+print("Meses test segunda capa GLM :", hyb_glm_test_months)
+print("Train shape:", hyb_glm_train.shape, "| tasa:", round(hyb_glm_train["y_hyb_glm"].mean(), 4))
+print("Test shape :", hyb_glm_test.shape, "| tasa:", round(hyb_glm_test["y_hyb_glm"].mean(), 4))
+
+# ============================================================
+# 15.6 Preparación matriz GLM segunda capa
+# ============================================================
+print_section("15.6) MATRIZ SEGUNDA CAPA GLM")
+
+def collapse_rare_categories_hyb_glm(train_df, test_df, cols, top_n=5):
+    train_out = train_df.copy()
+    test_out = test_df.copy()
+
+    for c in cols:
+        if c not in train_out.columns:
+            continue
+
+        train_out[c] = train_out[c].fillna("MISSING").astype(str).str.strip().str.upper()
+        test_out[c] = test_out[c].fillna("MISSING").astype(str).str.strip().str.upper()
+
+        top_levels = train_out[c].value_counts().head(top_n).index.tolist()
+
+        train_out[c] = np.where(train_out[c].isin(top_levels), train_out[c], "OTROS")
+        test_out[c] = np.where(test_out[c].isin(top_levels), test_out[c], "OTROS")
+
+    return train_out, test_out
+
+hyb_glm_train_prep = hyb_glm_train.copy()
+hyb_glm_test_prep = hyb_glm_test.copy()
+
+for c in hyb_glm_num_features:
+    hyb_glm_train_prep[c] = pd.to_numeric(hyb_glm_train_prep[c], errors="coerce")
+    hyb_glm_test_prep[c] = pd.to_numeric(hyb_glm_test_prep[c], errors="coerce")
+    med = hyb_glm_train_prep[c].median()
+    hyb_glm_train_prep[c] = hyb_glm_train_prep[c].fillna(med)
+    hyb_glm_test_prep[c] = hyb_glm_test_prep[c].fillna(med)
+
+hyb_glm_train_prep, hyb_glm_test_prep = collapse_rare_categories_hyb_glm(
+    hyb_glm_train_prep, hyb_glm_test_prep, hyb_glm_cat_features, top_n=5
+)
+
+Xh_train_num = hyb_glm_train_prep[hyb_glm_num_features].copy()
+Xh_test_num = hyb_glm_test_prep[hyb_glm_num_features].copy()
+
+Xh_train_cat = pd.get_dummies(
+    hyb_glm_train_prep[hyb_glm_cat_features],
+    prefix=hyb_glm_cat_features,
+    drop_first=True,
+    dtype=float
+)
+Xh_test_cat = pd.get_dummies(
+    hyb_glm_test_prep[hyb_glm_cat_features],
+    prefix=hyb_glm_cat_features,
+    drop_first=True,
+    dtype=float
+)
+
+Xh_test_cat = Xh_test_cat.reindex(columns=Xh_train_cat.columns, fill_value=0.0)
+
+Xh_train = pd.concat([Xh_train_num, Xh_train_cat], axis=1)
+Xh_test = pd.concat([Xh_test_num, Xh_test_cat], axis=1)
+
+Xh_train = Xh_train.apply(pd.to_numeric, errors="coerce").astype(float)
+Xh_test = Xh_test.apply(pd.to_numeric, errors="coerce").astype(float)
+
+xh_medians = Xh_train.median()
+Xh_train = Xh_train.fillna(xh_medians)
+Xh_test = Xh_test.fillna(xh_medians)
+
+Xh_train = sm.add_constant(Xh_train, has_constant="add")
+Xh_test = sm.add_constant(Xh_test, has_constant="add")
+Xh_test = Xh_test.reindex(columns=Xh_train.columns, fill_value=0.0)
+
+yh_train = pd.to_numeric(hyb_glm_train_prep["y_hyb_glm"], errors="coerce").fillna(0).astype(float)
+yh_test = pd.to_numeric(hyb_glm_test_prep["y_hyb_glm"], errors="coerce").fillna(0).astype(float)
+
+print("Shape Xh_train:", Xh_train.shape)
+print("Shape Xh_test :", Xh_test.shape)
+
+# ============================================================
+# 15.7 GLM regularizado segunda capa
+# ============================================================
+print_section("15.7) ENTRENAMIENTO SEGUNDA CAPA GLM")
+
+hyb_glm_bin = sm.GLM(
+    yh_train.values,
+    Xh_train.values,
+    family=sm.families.Binomial()
+)
+
+hyb_glm_fit = hyb_glm_bin.fit_regularized(
+    alpha=0.05,
+    L1_wt=0.0,
+    maxiter=1000
+)
+
+pred_hyb_glm_train = hyb_glm_fit.predict(Xh_train.values)
+pred_hyb_glm_test = hyb_glm_fit.predict(Xh_test.values)
+
+print("AUC train segunda capa GLM:", round(roc_auc_score(yh_train, pred_hyb_glm_train), 4))
+print("AUC test segunda capa GLM :", round(roc_auc_score(yh_test, pred_hyb_glm_test), 4))
+print("PR-AUC train segunda capa GLM:", round(average_precision_score(yh_train, pred_hyb_glm_train), 4))
+print("PR-AUC test segunda capa GLM :", round(average_precision_score(yh_test, pred_hyb_glm_test), 4))
+
+# ============================================================
+# 15.8 Score híbrido final
+# no tempranos = 0
+# tempranos = score GLM segunda capa
+# ============================================================
+print_section("15.8) SCORE HÍBRIDO GLM FINAL")
+
+hyb_glm_sub["score_hyb_glm_second"] = hyb_glm_fit.predict(
+    pd.concat([Xh_train, Xh_test], axis=0).loc[hyb_glm_sub.index.intersection(pd.concat([Xh_train, Xh_test], axis=0).index)] if False else 0
+)
