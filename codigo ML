@@ -3380,3 +3380,460 @@ print("AUC invertida segunda capa:", roc_auc_score(y_test_hyb, 1 - pred_test_hyb
 print("PR-AUC normal segunda capa:", average_precision_score(y_test_hyb, pred_test_hyb))
 print("PR-AUC invertida segunda capa:", average_precision_score(y_test_hyb, 1 - pred_test_hyb))
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# 13) CANDIDATO PRODUCTIVO CON GLM (statsmodels)
+# Objetivo:
+# probar un enfoque más parsimonioso e interpretable usando
+# GLM Binomial sobre el universo productivo
+# ============================================================
+
+print_section("13) CANDIDATO PRODUCTIVO CON GLM")
+
+import statsmodels.api as sm
+
+# ============================================================
+# 13.1 Universo productivo
+# ============================================================
+glm_df = df.copy()
+glm_df = add_suspicion_features(glm_df)
+
+safe_upper_col(glm_df, "AGRUPACION_QS")
+safe_upper_col(glm_df, "COB")
+
+glm_df = glm_df[
+    (glm_df["AGRUPACION_QS"] == "FALABELLA") &
+    (glm_df["FEC_OCURRENCIA_FINAL"] >= BREAK_DATE) &
+    (glm_df["COB"] == "COMPRA PROTEGIDA X ROBO")
+].copy()
+
+if glm_df.empty:
+    raise ValueError("No hay registros para el universo GLM.")
+
+glm_df["y_glm"] = (glm_df["SOSPECHA_FINAL"].fillna(0) >= 2).astype(int)
+glm_df["year_month"] = glm_df["FEC_OCURRENCIA_FINAL"].dt.to_period("M").astype(str)
+
+print("Shape universo GLM:", glm_df.shape)
+print("Tasa y_glm:", round(glm_df["y_glm"].mean(), 4))
+display(glm_df.head(3))
+
+# ============================================================
+# 13.2 Features candidatas GLM
+# ============================================================
+print_section("13.2) FEATURES GLM")
+
+glm_num_features = [c for c in [
+    "DIF_VIGENCIA",
+    "USO_TOPE",
+    "EDAD_AL_SINIESTRO",
+    "N_SEG_12M_PRE_OCURR",
+    "COUNT_OF_NUMERO_FINAL",
+    "CUENTA_SIN_FAMILIAR_AUX",
+    "MONTO_FINAL_UF"
+] if c in glm_df.columns]
+
+glm_cat_features = [c for c in [
+    "PLAN_AUX",
+    "COMUNA_PER",
+    "MEDIO_PAGO_SEG"
+] if c in glm_df.columns]
+
+glm_features = glm_num_features + glm_cat_features
+print("Features GLM:")
+print(glm_features)
+
+# ============================================================
+# 13.3 Split temporal (mismo criterio del bloque 10)
+# últimos 3 meses = test
+# ============================================================
+print_section("13.3) SPLIT TEMPORAL GLM")
+
+glm_months = sorted(glm_df["year_month"].dropna().unique())
+if len(glm_months) < 6:
+    raise ValueError(f"Hay muy pocos meses ({len(glm_months)}) para validación temporal GLM.")
+
+glm_test_months = glm_months[-3:]
+glm_train_months = glm_months[:-3]
+
+glm_df["is_test_time_glm"] = glm_df["year_month"].isin(glm_test_months).astype(int)
+
+glm_train_mask = glm_df["is_test_time_glm"] == 0
+glm_test_mask = glm_df["is_test_time_glm"] == 1
+
+glm_train = glm_df.loc[glm_train_mask].copy()
+glm_test = glm_df.loc[glm_test_mask].copy()
+
+print("Meses train GLM:", glm_train_months)
+print("Meses test GLM :", glm_test_months)
+print("Train shape:", glm_train.shape, "| tasa sospecha:", round(glm_train["y_glm"].mean(), 4))
+print("Test shape :", glm_test.shape, "| tasa sospecha:", round(glm_test["y_glm"].mean(), 4))
+
+# ============================================================
+# 13.4 Preparación matriz GLM
+# - imputación simple
+# - colapso de categorías raras
+# - dummies
+# ============================================================
+print_section("13.4) MATRIZ GLM")
+
+def collapse_rare_categories(train_df, test_df, cols, top_n=10):
+    train_out = train_df.copy()
+    test_out = test_df.copy()
+
+    for c in cols:
+        if c not in train_out.columns:
+            continue
+
+        train_out[c] = train_out[c].fillna("MISSING").astype(str).str.strip().str.upper()
+        test_out[c] = test_out[c].fillna("MISSING").astype(str).str.strip().str.upper()
+
+        top_levels = train_out[c].value_counts().head(top_n).index.tolist()
+
+        train_out[c] = np.where(train_out[c].isin(top_levels), train_out[c], "OTROS")
+        test_out[c] = np.where(test_out[c].isin(top_levels), test_out[c], "OTROS")
+
+    return train_out, test_out
+
+glm_train_prep = glm_train.copy()
+glm_test_prep = glm_test.copy()
+
+# imputación numérica
+for c in glm_num_features:
+    glm_train_prep[c] = pd.to_numeric(glm_train_prep[c], errors="coerce")
+    glm_test_prep[c] = pd.to_numeric(glm_test_prep[c], errors="coerce")
+    med = glm_train_prep[c].median()
+    glm_train_prep[c] = glm_train_prep[c].fillna(med)
+    glm_test_prep[c] = glm_test_prep[c].fillna(med)
+
+# colapsar categorías raras
+glm_train_prep, glm_test_prep = collapse_rare_categories(
+    glm_train_prep, glm_test_prep, glm_cat_features, top_n=10
+)
+
+# interacción explícita
+if {"DIF_VIGENCIA", "USO_TOPE"}.issubset(glm_train_prep.columns):
+    glm_train_prep["INTER_DIFXTOPE_GLM"] = glm_train_prep["DIF_VIGENCIA"] * glm_train_prep["USO_TOPE"]
+    glm_test_prep["INTER_DIFXTOPE_GLM"] = glm_test_prep["DIF_VIGENCIA"] * glm_test_prep["USO_TOPE"]
+    glm_num_features_glm = glm_num_features + ["INTER_DIFXTOPE_GLM"]
+else:
+    glm_num_features_glm = glm_num_features.copy()
+
+# dummies
+X_train_num = glm_train_prep[glm_num_features_glm].copy()
+X_test_num = glm_test_prep[glm_num_features_glm].copy()
+
+X_train_cat = pd.get_dummies(glm_train_prep[glm_cat_features], prefix=glm_cat_features, drop_first=True)
+X_test_cat = pd.get_dummies(glm_test_prep[glm_cat_features], prefix=glm_cat_features, drop_first=True)
+
+# alinear columnas entre train y test
+X_test_cat = X_test_cat.reindex(columns=X_train_cat.columns, fill_value=0)
+
+X_train_glm = pd.concat([X_train_num, X_train_cat], axis=1)
+X_test_glm = pd.concat([X_test_num, X_test_cat], axis=1)
+
+# constante
+X_train_glm = sm.add_constant(X_train_glm, has_constant="add")
+X_test_glm = sm.add_constant(X_test_glm, has_constant="add")
+
+y_train_glm = glm_train_prep["y_glm"].astype(int)
+y_test_glm = glm_test_prep["y_glm"].astype(int)
+
+print("Shape X_train_glm:", X_train_glm.shape)
+print("Shape X_test_glm :", X_test_glm.shape)
+
+# ============================================================
+# 13.5 Entrenamiento GLM Binomial
+# ============================================================
+print_section("13.5) ENTRENAMIENTO GLM")
+
+glm_bin = sm.GLM(
+    y_train_glm,
+    X_train_glm,
+    family=sm.families.Binomial()
+)
+
+glm_fit = glm_bin.fit()
+
+print(glm_fit.summary())
+
+pred_train_glm = glm_fit.predict(X_train_glm)
+pred_test_glm = glm_fit.predict(X_test_glm)
+
+print_section("13.5) MÉTRICAS GLM")
+print("AUC train:", round(roc_auc_score(y_train_glm, pred_train_glm), 4))
+print("AUC test :", round(roc_auc_score(y_test_glm, pred_test_glm), 4))
+print("PR-AUC train:", round(average_precision_score(y_train_glm, pred_train_glm), 4))
+print("PR-AUC test :", round(average_precision_score(y_test_glm, pred_test_glm), 4))
+
+# ============================================================
+# 13.6 Coeficientes y odds ratios
+# ============================================================
+print_section("13.6) COEFICIENTES Y ODDS RATIOS")
+
+coef_table = pd.DataFrame({
+    "feature": glm_fit.params.index,
+    "coef": glm_fit.params.values,
+    "odds_ratio": np.exp(glm_fit.params.values),
+    "p_value": glm_fit.pvalues.values
+}).sort_values("coef", ascending=False)
+
+display(coef_table.head(25))
+coef_table.to_csv(os.path.join(OUT_DIR, "glm_coef_odds_ratios.csv"), index=False)
+
+# ============================================================
+# 13.7 Importance proxy por magnitud estandarizada
+# (para storytelling; en GLM importan más coef y OR que "importance")
+# ============================================================
+print_section("13.7) RANKING DE COEFICIENTES")
+
+coef_rank = coef_table[
+    coef_table["feature"] != "const"
+].copy()
+
+coef_rank["abs_coef"] = coef_rank["coef"].abs()
+coef_rank = coef_rank.sort_values("abs_coef", ascending=False)
+
+display(coef_rank.head(20))
+coef_rank.to_csv(os.path.join(OUT_DIR, "glm_rank_coeficientes.csv"), index=False)
+
+# ============================================================
+# 13.8 Score GLM sobre todo el universo productivo
+# ============================================================
+print_section("13.8) SCORE GLM SOBRE TODO EL UNIVERSO")
+
+glm_all = glm_df.copy()
+
+# mismas transformaciones que train/test
+for c in glm_num_features:
+    glm_all[c] = pd.to_numeric(glm_all[c], errors="coerce")
+    med = glm_train_prep[c].median()
+    glm_all[c] = glm_all[c].fillna(med)
+
+for c in glm_cat_features:
+    glm_all[c] = glm_all[c].fillna("MISSING").astype(str).str.strip().str.upper()
+    top_levels = glm_train_prep[c].value_counts().head(10).index.tolist()
+    glm_all[c] = np.where(glm_all[c].isin(top_levels), glm_all[c], "OTROS")
+
+if "INTER_DIFXTOPE_GLM" in X_train_glm.columns and {"DIF_VIGENCIA", "USO_TOPE"}.issubset(glm_all.columns):
+    glm_all["INTER_DIFXTOPE_GLM"] = glm_all["DIF_VIGENCIA"] * glm_all["USO_TOPE"]
+
+X_all_num = glm_all[glm_num_features_glm].copy()
+X_all_cat = pd.get_dummies(glm_all[glm_cat_features], prefix=glm_cat_features, drop_first=True)
+X_all_cat = X_all_cat.reindex(columns=X_train_cat.columns, fill_value=0)
+
+X_all_glm = pd.concat([X_all_num, X_all_cat], axis=1)
+X_all_glm = sm.add_constant(X_all_glm, has_constant="add")
+X_all_glm = X_all_glm.reindex(columns=X_train_glm.columns, fill_value=0)
+
+glm_df["score_glm_prod"] = glm_fit.predict(X_all_glm)
+
+# ============================================================
+# 13.9 Benchmark GLM vs regla simple vs modelo previo
+# ============================================================
+print_section("13.9) BENCHMARK GLM")
+
+glm_test_eval = glm_df.loc[glm_test_mask, [id_col, "FEC_OCURRENCIA_FINAL", "y_glm"]].copy()
+glm_test_eval["score_glm_prod"] = pred_test_glm
+glm_test_eval["score_rule_difvig"] = -pd.to_numeric(glm_test.loc[glm_test_mask, "DIF_VIGENCIA"] if False else glm_test_prep["DIF_VIGENCIA"], errors="coerce").fillna(999999).values
+
+# score del modelo productivo previo si existe
+if "score_prod" in glm_df.columns:
+    glm_test_eval["score_prod_prev"] = glm_df.loc[glm_test_mask, "score_prod"].values
+else:
+    glm_test_eval["score_prod_prev"] = 0.0
+
+benchmark_glm_rows = []
+
+bench_glm_dict = {
+    "glm_productivo": glm_test_eval["score_glm_prod"],
+    "regla_dif_vigencia": glm_test_eval["score_rule_difvig"],
+    "modelo_productivo_prev": glm_test_eval["score_prod_prev"]
+}
+
+for name, scores in bench_glm_dict.items():
+    row = {
+        "modelo": name,
+        "auc_test": roc_auc_score(glm_test_eval["y_glm"], scores),
+        "pr_auc_test": average_precision_score(glm_test_eval["y_glm"], scores)
+    }
+
+    for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+        k_n = max(1, int(len(glm_test_eval) * frac))
+        row[f"precision_top_{int(frac*100)}pct"] = precision_at_k(
+            glm_test_eval["y_glm"].reset_index(drop=True),
+            pd.Series(scores).reset_index(drop=True),
+            k_n
+        )
+
+    benchmark_glm_rows.append(row)
+
+benchmark_glm_df = pd.DataFrame(benchmark_glm_rows).sort_values(["pr_auc_test", "auc_test"], ascending=False)
+
+display(benchmark_glm_df)
+benchmark_glm_df.to_csv(os.path.join(OUT_DIR, "benchmark_glm_vs_reglas.csv"), index=False)
+
+# ============================================================
+# 13.10 Deciles del score GLM
+# ============================================================
+print_section("13.10) DECILES DEL SCORE GLM")
+
+glm_test_eval["score_rank"] = glm_test_eval["score_glm_prod"].rank(method="first")
+glm_test_eval["decil_glm"] = pd.qcut(glm_test_eval["score_rank"], 10, labels=[f"D{i}" for i in range(1, 11)])
+
+glm_decil_table = (
+    glm_test_eval
+    .groupby("decil_glm")
+    .agg(
+        n=(id_col, "count"),
+        n_sospechosos=("y_glm", "sum"),
+        tasa_sospecha=("y_glm", "mean"),
+        score_min=("score_glm_prod", "min"),
+        score_max=("score_glm_prod", "max"),
+        score_avg=("score_glm_prod", "mean")
+    )
+    .reset_index()
+)
+
+overall_glm_rate = glm_test_eval["y_glm"].mean()
+glm_decil_table["lift_vs_promedio"] = glm_decil_table["tasa_sospecha"] / overall_glm_rate
+
+display(glm_decil_table)
+glm_decil_table.to_csv(os.path.join(OUT_DIR, "deciles_glm_productivo_test.csv"), index=False)
+
+plt.figure(figsize=(10, 6))
+sns.barplot(data=glm_decil_table, x="decil_glm", y="tasa_sospecha")
+plt.title("Tasa de sospecha por decil de score - GLM productivo")
+plt.xlabel("Decil de score")
+plt.ylabel("Tasa de sospecha")
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 13.11 Cobertura acumulada GLM
+# ============================================================
+print_section("13.11) COBERTURA ACUMULADA GLM")
+
+glm_test_eval = glm_test_eval.sort_values("score_glm_prod", ascending=False).reset_index(drop=True)
+glm_test_eval["cum_sospechosos"] = glm_test_eval["y_glm"].cumsum()
+total_glm_sos = glm_test_eval["y_glm"].sum()
+glm_test_eval["recall_acumulado"] = glm_test_eval["cum_sospechosos"] / total_glm_sos if total_glm_sos > 0 else np.nan
+glm_test_eval["pct_revisado"] = (np.arange(len(glm_test_eval)) + 1) / len(glm_test_eval)
+
+glm_coverage_rows = []
+for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+    subset = glm_test_eval.iloc[:max(1, int(len(glm_test_eval) * frac))]
+    glm_coverage_rows.append({
+        "pct_revisado": frac,
+        "n_revisado": len(subset),
+        "precision": subset["y_glm"].mean(),
+        "recall": subset["y_glm"].sum() / total_glm_sos if total_glm_sos > 0 else np.nan
+    })
+
+glm_coverage_df = pd.DataFrame(glm_coverage_rows)
+
+display(glm_coverage_df)
+glm_coverage_df.to_csv(os.path.join(OUT_DIR, "coverage_glm_productivo_test.csv"), index=False)
+
+# ============================================================
+# 13.12 Tramos operativos GLM
+# ============================================================
+print_section("13.12) TRAMOS OPERATIVOS GLM")
+
+p99_glm = glm_df["score_glm_prod"].quantile(0.99)
+p95_glm = glm_df["score_glm_prod"].quantile(0.95)
+p90_glm = glm_df["score_glm_prod"].quantile(0.90)
+
+glm_df["nivel_riesgo_glm"] = np.select(
+    [
+        glm_df["score_glm_prod"] >= p99_glm,
+        glm_df["score_glm_prod"] >= p95_glm,
+        glm_df["score_glm_prod"] >= p90_glm
+    ],
+    [
+        "ALTO_RIESGO",
+        "RIESGO_MEDIO_ALTO",
+        "MONITOREO"
+    ],
+    default="BASE"
+)
+
+glm_risk_table = (
+    glm_df
+    .groupby("nivel_riesgo_glm")
+    .agg(
+        n=(id_col, "count"),
+        tasa_sospecha=("y_glm", "mean"),
+        score_min=("score_glm_prod", "min"),
+        score_max=("score_glm_prod", "max")
+    )
+    .reset_index()
+    .sort_values("score_min", ascending=False)
+)
+
+display(glm_risk_table)
+glm_risk_table.to_csv(os.path.join(OUT_DIR, "tramos_operativos_glm.csv"), index=False)
+
+# ============================================================
+# 13.13 Top casos GLM
+# ============================================================
+print_section("13.13) TOP CASOS GLM")
+
+cols_glm_review = [c for c in [
+    id_col,
+    "FEC_OCURRENCIA_FINAL",
+    "RUT_JOIN",
+    "POLIZA_JOIN",
+    "PLAN_AUX",
+    "COMUNA_PER",
+    "MEDIO_PAGO_SEG",
+    "DIF_VIGENCIA",
+    "USO_TOPE",
+    "COUNT_OF_NUMERO_FINAL",
+    "CUENTA_SIN_FAMILIAR_AUX",
+    "N_SEG_12M_PRE_OCURR",
+    "MONTO_FINAL_UF",
+    "EDAD_AL_SINIESTRO",
+    "score_glm_prod",
+    "nivel_riesgo_glm",
+    "y_glm"
+] if c in glm_df.columns]
+
+top_glm = glm_df.sort_values("score_glm_prod", ascending=False)[cols_glm_review].head(300)
+display(top_glm.head(20))
+top_glm.to_csv(os.path.join(OUT_DIR, "top300_glm_productivo.csv"), index=False)
+
+# ============================================================
+# 13.14 Resumen final
+# ============================================================
+print_section("13.14) RESUMEN BLOQUE 13")
+print("1) Este bloque prueba un GLM Binomial como alternativa más interpretable y estable.")
+print("2) glm_coef_odds_ratios.csv entrega coeficientes, odds ratios y p-values.")
+print("3) benchmark_glm_vs_reglas.csv compara GLM contra DIF_VIGENCIA y el modelo previo.")
+print("4) deciles_glm_productivo_test.csv y coverage_glm_productivo_test.csv muestran utilidad operativa.")
+print("5) tramos_operativos_glm.csv propone segmentación de riesgo usando el score GLM.")
