@@ -4829,6 +4829,447 @@ print("4) tramos_operativos_hibrido_glm.csv propone segmentación de riesgo para
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# 16) COMPARACIÓN 1:1
+# POLÍTICA DE REGLAS VS ML MÍNIMO
+# Objetivo:
+# comparar directamente una política de reglas operativas
+# contra un GLM mínimo usando muy pocas variables
+# ============================================================
+
+print_section("16) COMPARACIÓN 1:1 | REGLAS VS ML MÍNIMO")
+
+import statsmodels.api as sm
+
+# ============================================================
+# 16.1 Universo de comparación
+# ============================================================
+cmp_df = df.copy()
+cmp_df = add_suspicion_features(cmp_df)
+
+safe_upper_col(cmp_df, "AGRUPACION_QS")
+safe_upper_col(cmp_df, "COB")
+
+cmp_df = cmp_df[
+    (cmp_df["AGRUPACION_QS"] == "FALABELLA") &
+    (cmp_df["FEC_OCURRENCIA_FINAL"] >= BREAK_DATE) &
+    (cmp_df["COB"] == "COMPRA PROTEGIDA X ROBO")
+].copy()
+
+if cmp_df.empty:
+    raise ValueError("No hay registros para el universo de comparación 1:1.")
+
+cmp_df["y_cmp"] = (cmp_df["SOSPECHA_FINAL"].fillna(0) >= 2).astype(int)
+cmp_df["year_month"] = cmp_df["FEC_OCURRENCIA_FINAL"].dt.to_period("M").astype(str)
+
+print("Shape universo comparación:", cmp_df.shape)
+print("Tasa y_cmp:", round(cmp_df["y_cmp"].mean(), 4))
+display(cmp_df.head(3))
+
+# ============================================================
+# 16.2 Split temporal
+# ============================================================
+print_section("16.2) SPLIT TEMPORAL")
+
+cmp_months = sorted(cmp_df["year_month"].dropna().unique())
+if len(cmp_months) < 6:
+    raise ValueError(f"Hay muy pocos meses ({len(cmp_months)}) para comparación temporal 1:1.")
+
+cmp_test_months = cmp_months[-3:]
+cmp_train_months = cmp_months[:-3]
+
+cmp_df["is_test_time_cmp"] = cmp_df["year_month"].isin(cmp_test_months).astype(int)
+
+cmp_train_mask = cmp_df["is_test_time_cmp"] == 0
+cmp_test_mask = cmp_df["is_test_time_cmp"] == 1
+
+cmp_train = cmp_df.loc[cmp_train_mask].copy()
+cmp_test = cmp_df.loc[cmp_test_mask].copy()
+
+print("Meses train:", cmp_train_months)
+print("Meses test :", cmp_test_months)
+print("Train shape:", cmp_train.shape, "| tasa:", round(cmp_train["y_cmp"].mean(), 4))
+print("Test shape :", cmp_test.shape, "| tasa:", round(cmp_test["y_cmp"].mean(), 4))
+
+# ============================================================
+# 16.3 Modelo 1: Política de reglas
+# Ajusta estos puntos si quieres iterar:
+# - DIF_VIGENCIA como eje central
+# - refuerzo por uso de tope, familiar y seguros recientes
+# ============================================================
+print_section("16.3) POLÍTICA DE REGLAS")
+
+for c in ["DIF_VIGENCIA", "USO_TOPE", "CUENTA_SIN_FAMILIAR_AUX", "N_SEG_12M_PRE_OCURR", "EDAD_AL_SINIESTRO"]:
+    if c in cmp_df.columns:
+        cmp_df[c] = pd.to_numeric(cmp_df[c], errors="coerce")
+
+# score por puntos
+cmp_df["score_reglas"] = 0.0
+
+# capa principal: DIF_VIGENCIA
+cmp_df["score_reglas"] += np.where(cmp_df["DIF_VIGENCIA"] < 10, 6.0, 0.0)
+cmp_df["score_reglas"] += np.where((cmp_df["DIF_VIGENCIA"] >= 10) & (cmp_df["DIF_VIGENCIA"] < 20), 4.5, 0.0)
+cmp_df["score_reglas"] += np.where((cmp_df["DIF_VIGENCIA"] >= 20) & (cmp_df["DIF_VIGENCIA"] < 31), 3.0, 0.0)
+cmp_df["score_reglas"] += np.where((cmp_df["DIF_VIGENCIA"] >= 31) & (cmp_df["DIF_VIGENCIA"] < 46), 1.5, 0.0)
+
+# refuerzos secundarios
+cmp_df["score_reglas"] += np.where(cmp_df["USO_TOPE"] >= 0.80, 1.5, 0.0)
+cmp_df["score_reglas"] += np.where((cmp_df["USO_TOPE"] >= 0.70) & (cmp_df["USO_TOPE"] < 0.80), 0.75, 0.0)
+cmp_df["score_reglas"] += np.where(cmp_df["CUENTA_SIN_FAMILIAR_AUX"] > 0, 1.0, 0.0)
+cmp_df["score_reglas"] += np.where(cmp_df["N_SEG_12M_PRE_OCURR"] >= 3, 0.75, 0.0)
+cmp_df["score_reglas"] += np.where(cmp_df["EDAD_AL_SINIESTRO"] < 35, 0.50, 0.0)
+
+# score de regla simple pura para benchmark
+cmp_df["score_difvig_simple"] = -pd.to_numeric(cmp_df["DIF_VIGENCIA"], errors="coerce").fillna(999999)
+
+# ============================================================
+# 16.4 Modelo 2: ML mínimo (GLM)
+# Variables mínimas, sin comunas ni muchas dummies
+# ============================================================
+print_section("16.4) ML MÍNIMO (GLM)")
+
+glm_min_num_features = [c for c in [
+    "DIF_VIGENCIA",
+    "USO_TOPE",
+    "CUENTA_SIN_FAMILIAR_AUX",
+    "N_SEG_12M_PRE_OCURR",
+    "EDAD_AL_SINIESTRO"
+] if c in cmp_df.columns]
+
+print("Features ML mínimo:")
+print(glm_min_num_features)
+
+glm_min_train = cmp_df.loc[cmp_train_mask].copy()
+glm_min_test = cmp_df.loc[cmp_test_mask].copy()
+
+for c in glm_min_num_features:
+    glm_min_train[c] = pd.to_numeric(glm_min_train[c], errors="coerce")
+    glm_min_test[c] = pd.to_numeric(glm_min_test[c], errors="coerce")
+    med = glm_min_train[c].median()
+    glm_min_train[c] = glm_min_train[c].fillna(med)
+    glm_min_test[c] = glm_min_test[c].fillna(med)
+
+# interacción mínima
+glm_min_train["INTER_DIFXTOPE_MIN"] = glm_min_train["DIF_VIGENCIA"] * glm_min_train["USO_TOPE"]
+glm_min_test["INTER_DIFXTOPE_MIN"] = glm_min_test["DIF_VIGENCIA"] * glm_min_test["USO_TOPE"]
+
+glm_min_features_final = glm_min_num_features + ["INTER_DIFXTOPE_MIN"]
+
+X_min_train = glm_min_train[glm_min_features_final].copy()
+X_min_test = glm_min_test[glm_min_features_final].copy()
+
+X_min_train = X_min_train.apply(pd.to_numeric, errors="coerce").astype(float)
+X_min_test = X_min_test.apply(pd.to_numeric, errors="coerce").astype(float)
+
+x_min_medians = X_min_train.median()
+X_min_train = X_min_train.fillna(x_min_medians)
+X_min_test = X_min_test.fillna(x_min_medians)
+
+X_min_train = sm.add_constant(X_min_train, has_constant="add")
+X_min_test = sm.add_constant(X_min_test, has_constant="add")
+X_min_test = X_min_test.reindex(columns=X_min_train.columns, fill_value=0.0)
+
+y_min_train = pd.to_numeric(glm_min_train["y_cmp"], errors="coerce").fillna(0).astype(float)
+y_min_test = pd.to_numeric(glm_min_test["y_cmp"], errors="coerce").fillna(0).astype(float)
+
+glm_min_bin = sm.GLM(
+    y_min_train.values,
+    X_min_train.values,
+    family=sm.families.Binomial()
+)
+
+glm_min_fit = glm_min_bin.fit_regularized(
+    alpha=0.05,
+    L1_wt=0.0,
+    maxiter=1000
+)
+
+pred_min_train = glm_min_fit.predict(X_min_train.values)
+pred_min_test = glm_min_fit.predict(X_min_test.values)
+
+cmp_df.loc[cmp_train_mask, "score_glm_min"] = pred_min_train
+cmp_df.loc[cmp_test_mask, "score_glm_min"] = pred_min_test
+
+# score glm mínimo sobre todo el universo
+glm_min_all = cmp_df.copy()
+for c in glm_min_num_features:
+    glm_min_all[c] = pd.to_numeric(glm_min_all[c], errors="coerce")
+    med = glm_min_train[c].median()
+    glm_min_all[c] = glm_min_all[c].fillna(med)
+glm_min_all["INTER_DIFXTOPE_MIN"] = glm_min_all["DIF_VIGENCIA"] * glm_min_all["USO_TOPE"]
+
+X_min_all = glm_min_all[glm_min_features_final].copy()
+X_min_all = X_min_all.apply(pd.to_numeric, errors="coerce").astype(float)
+X_min_all = X_min_all.fillna(x_min_medians)
+X_min_all = sm.add_constant(X_min_all, has_constant="add")
+X_min_all = X_min_all.reindex(columns=X_min_train.columns, fill_value=0.0)
+
+cmp_df["score_glm_min_all"] = glm_min_fit.predict(X_min_all.values)
+
+print("AUC train ML mínimo:", round(roc_auc_score(y_min_train, pred_min_train), 4))
+print("AUC test  ML mínimo:", round(roc_auc_score(y_min_test, pred_min_test), 4))
+print("PR-AUC train ML mínimo:", round(average_precision_score(y_min_train, pred_min_train), 4))
+print("PR-AUC test  ML mínimo:", round(average_precision_score(y_min_test, pred_min_test), 4))
+
+# ============================================================
+# 16.5 Benchmark 1:1
+# ============================================================
+print_section("16.5) BENCHMARK 1:1")
+
+cmp_test_eval = cmp_df.loc[cmp_test_mask, [id_col, "FEC_OCURRENCIA_FINAL", "y_cmp"]].copy()
+cmp_test_eval["score_reglas"] = cmp_df.loc[cmp_test_mask, "score_reglas"].values
+cmp_test_eval["score_difvig_simple"] = cmp_df.loc[cmp_test_mask, "score_difvig_simple"].values
+cmp_test_eval["score_glm_min"] = cmp_df.loc[cmp_test_mask, "score_glm_min"].values
+
+bench_compare = {
+    "regla_dif_vigencia": cmp_test_eval["score_difvig_simple"],
+    "politica_reglas": cmp_test_eval["score_reglas"],
+    "ml_minimo_glm": cmp_test_eval["score_glm_min"]
+}
+
+bench_compare_rows = []
+
+for name, scores in bench_compare.items():
+    row = {
+        "modelo": name,
+        "auc_test": roc_auc_score(cmp_test_eval["y_cmp"], scores),
+        "pr_auc_test": average_precision_score(cmp_test_eval["y_cmp"], scores)
+    }
+
+    for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+        k_n = max(1, int(len(cmp_test_eval) * frac))
+        row[f"precision_top_{int(frac*100)}pct"] = precision_at_k(
+            cmp_test_eval["y_cmp"].reset_index(drop=True),
+            pd.Series(scores).reset_index(drop=True),
+            k_n
+        )
+
+    bench_compare_rows.append(row)
+
+benchmark_1v1_df = pd.DataFrame(bench_compare_rows).sort_values(["pr_auc_test", "auc_test"], ascending=False)
+
+display(benchmark_1v1_df)
+benchmark_1v1_df.to_csv(os.path.join(OUT_DIR, "benchmark_1v1_reglas_vs_ml_minimo.csv"), index=False)
+
+# ============================================================
+# 16.6 Deciles / cobertura política de reglas
+# ============================================================
+print_section("16.6) DECILES Y COBERTURA - POLÍTICA DE REGLAS")
+
+rules_eval = cmp_test_eval[[id_col, "y_cmp", "score_reglas"]].copy()
+rules_eval["score_rank"] = rules_eval["score_reglas"].rank(method="first")
+rules_eval["decil_reglas"] = pd.qcut(rules_eval["score_rank"], 10, labels=[f"D{i}" for i in range(1, 11)])
+
+rules_decil = (
+    rules_eval
+    .groupby("decil_reglas")
+    .agg(
+        n=(id_col, "count"),
+        n_sospechosos=("y_cmp", "sum"),
+        tasa_sospecha=("y_cmp", "mean"),
+        score_min=("score_reglas", "min"),
+        score_max=("score_reglas", "max"),
+        score_avg=("score_reglas", "mean")
+    )
+    .reset_index()
+)
+
+overall_rules_rate = rules_eval["y_cmp"].mean()
+rules_decil["lift_vs_promedio"] = rules_decil["tasa_sospecha"] / overall_rules_rate
+
+display(rules_decil)
+rules_decil.to_csv(os.path.join(OUT_DIR, "deciles_politica_reglas_test.csv"), index=False)
+
+rules_eval = rules_eval.sort_values("score_reglas", ascending=False).reset_index(drop=True)
+rules_eval["cum_sospechosos"] = rules_eval["y_cmp"].cumsum()
+total_rules_sos = rules_eval["y_cmp"].sum()
+
+rules_cov_rows = []
+for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+    subset = rules_eval.iloc[:max(1, int(len(rules_eval) * frac))]
+    rules_cov_rows.append({
+        "pct_revisado": frac,
+        "n_revisado": len(subset),
+        "precision": subset["y_cmp"].mean(),
+        "recall": subset["y_cmp"].sum() / total_rules_sos if total_rules_sos > 0 else np.nan
+    })
+
+rules_cov_df = pd.DataFrame(rules_cov_rows)
+display(rules_cov_df)
+rules_cov_df.to_csv(os.path.join(OUT_DIR, "coverage_politica_reglas_test.csv"), index=False)
+
+# ============================================================
+# 16.7 Deciles / cobertura ML mínimo
+# ============================================================
+print_section("16.7) DECILES Y COBERTURA - ML MÍNIMO")
+
+glm_min_eval = cmp_test_eval[[id_col, "y_cmp", "score_glm_min"]].copy()
+glm_min_eval["score_rank"] = glm_min_eval["score_glm_min"].rank(method="first")
+glm_min_eval["decil_glm_min"] = pd.qcut(glm_min_eval["score_rank"], 10, labels=[f"D{i}" for i in range(1, 11)])
+
+glm_min_decil = (
+    glm_min_eval
+    .groupby("decil_glm_min")
+    .agg(
+        n=(id_col, "count"),
+        n_sospechosos=("y_cmp", "sum"),
+        tasa_sospecha=("y_cmp", "mean"),
+        score_min=("score_glm_min", "min"),
+        score_max=("score_glm_min", "max"),
+        score_avg=("score_glm_min", "mean")
+    )
+    .reset_index()
+)
+
+overall_glm_min_rate = glm_min_eval["y_cmp"].mean()
+glm_min_decil["lift_vs_promedio"] = glm_min_decil["tasa_sospecha"] / overall_glm_min_rate
+
+display(glm_min_decil)
+glm_min_decil.to_csv(os.path.join(OUT_DIR, "deciles_ml_minimo_test.csv"), index=False)
+
+glm_min_eval = glm_min_eval.sort_values("score_glm_min", ascending=False).reset_index(drop=True)
+glm_min_eval["cum_sospechosos"] = glm_min_eval["y_cmp"].cumsum()
+total_glm_min_sos = glm_min_eval["y_cmp"].sum()
+
+glm_min_cov_rows = []
+for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+    subset = glm_min_eval.iloc[:max(1, int(len(glm_min_eval) * frac))]
+    glm_min_cov_rows.append({
+        "pct_revisado": frac,
+        "n_revisado": len(subset),
+        "precision": subset["y_cmp"].mean(),
+        "recall": subset["y_cmp"].sum() / total_glm_min_sos if total_glm_min_sos > 0 else np.nan
+    })
+
+glm_min_cov_df = pd.DataFrame(glm_min_cov_rows)
+display(glm_min_cov_df)
+glm_min_cov_df.to_csv(os.path.join(OUT_DIR, "coverage_ml_minimo_test.csv"), index=False)
+
+# ============================================================
+# 16.8 Tramos operativos finales de la política de reglas
+# ============================================================
+print_section("16.8) TRAMOS OPERATIVOS - POLÍTICA DE REGLAS")
+
+cmp_df["nivel_riesgo_reglas"] = np.select(
+    [
+        cmp_df["score_reglas"] >= 6.0,
+        cmp_df["score_reglas"] >= 4.0,
+        cmp_df["score_reglas"] >= 2.0
+    ],
+    [
+        "ALTO_RIESGO",
+        "RIESGO_MEDIO_ALTO",
+        "MONITOREO"
+    ],
+    default="BASE"
+)
+
+rules_risk_table = (
+    cmp_df
+    .groupby("nivel_riesgo_reglas")
+    .agg(
+        n=(id_col, "count"),
+        tasa_sospecha=("y_cmp", "mean"),
+        score_min=("score_reglas", "min"),
+        score_max=("score_reglas", "max")
+    )
+    .reset_index()
+    .sort_values("score_min", ascending=False)
+)
+
+display(rules_risk_table)
+rules_risk_table.to_csv(os.path.join(OUT_DIR, "tramos_operativos_politica_reglas.csv"), index=False)
+
+# ============================================================
+# 16.9 Tramos operativos ML mínimo
+# ============================================================
+print_section("16.9) TRAMOS OPERATIVOS - ML MÍNIMO")
+
+p99_min = cmp_df["score_glm_min_all"].quantile(0.99)
+p95_min = cmp_df["score_glm_min_all"].quantile(0.95)
+p90_min = cmp_df["score_glm_min_all"].quantile(0.90)
+
+cmp_df["nivel_riesgo_glm_min"] = np.select(
+    [
+        cmp_df["score_glm_min_all"] >= p99_min,
+        cmp_df["score_glm_min_all"] >= p95_min,
+        cmp_df["score_glm_min_all"] >= p90_min
+    ],
+    [
+        "ALTO_RIESGO",
+        "RIESGO_MEDIO_ALTO",
+        "MONITOREO"
+    ],
+    default="BASE"
+)
+
+glm_min_risk_table = (
+    cmp_df
+    .groupby("nivel_riesgo_glm_min")
+    .agg(
+        n=(id_col, "count"),
+        tasa_sospecha=("y_cmp", "mean"),
+        score_min=("score_glm_min_all", "min"),
+        score_max=("score_glm_min_all", "max")
+    )
+    .reset_index()
+    .sort_values("score_min", ascending=False)
+)
+
+display(glm_min_risk_table)
+glm_min_risk_table.to_csv(os.path.join(OUT_DIR, "tramos_operativos_ml_minimo.csv"), index=False)
+
+# ============================================================
+# 16.10 Coeficientes ML mínimo
+# ============================================================
+print_section("16.10) COEFICIENTES - ML MÍNIMO")
+
+coef_min_df = pd.DataFrame({
+    "feature": X_min_train.columns,
+    "coef": glm_min_fit.params,
+    "odds_ratio": np.exp(glm_min_fit.params),
+    "abs_coef": np.abs(glm_min_fit.params)
+}).sort_values("abs_coef", ascending=False)
+
+display(coef_min_df)
+coef_min_df.to_csv(os.path.join(OUT_DIR, "coeficientes_ml_minimo.csv"), index=False)
+
+# ============================================================
+# 16.11 Resumen final
+# ============================================================
+print_section("16.11) RESUMEN BLOQUE 16")
+print("1) benchmark_1v1_reglas_vs_ml_minimo.csv compara directamente regla simple, política de reglas y ML mínimo.")
+print("2) deciles_politica_reglas_test.csv y coverage_politica_reglas_test.csv miden la utilidad operativa de la política.")
+print("3) deciles_ml_minimo_test.csv y coverage_ml_minimo_test.csv miden la utilidad operativa del ML mínimo.")
+print("4) tramos_operativos_politica_reglas.csv y tramos_operativos_ml_minimo.csv permiten comparar implementaciones finales.")
+print("5) coeficientes_ml_minimo.csv resume el comportamiento del GLM mínimo.")
+
+
+
+
+
+
 Introducción
 
 El objetivo de este estudio fue analizar el aumento observado en la siniestralidad asociada a los productos de Falabella, con especial foco en la cobertura de Compra Protegida por Robo, y entender qué estaba explicando la subida de la tasa de entrada en ese negocio.
