@@ -1730,9 +1730,11 @@ print("6) extrapolacion_modelo_falabella_a_otros_socios.csv permite comparar el 
 
 
 
-
 # ============================================================
 # FUNCIÓN AUXILIAR PARA RECICLAR EL MODELO DE SOSPECHA
+# VERSIÓN ACTUALIZADA:
+# descompone TRAMO_DIF_VIG en:
+# <10, 10-19, 20-30, 31-45, 46-59, 60-89, 90-179, 180-364, 365+
 # ============================================================
 
 def run_suspicion_profile_block(
@@ -1780,8 +1782,46 @@ def run_suspicion_profile_block(
     print("Tasa sospechosos (y_sus):", round(work_df["y_sus"].mean(), 4))
     display(work_df.head(3))
 
+    # ========================================================
     # Features derivadas
+    # ========================================================
     work_df = add_suspicion_features(work_df)
+
+    # --------------------------------------------------------
+    # AJUSTE CLAVE:
+    # redefinimos TRAMO_DIF_VIG para abrir el tramo <31
+    # --------------------------------------------------------
+    if "DIF_VIGENCIA" in work_df.columns:
+        work_df["DIF_VIGENCIA"] = pd.to_numeric(work_df["DIF_VIGENCIA"], errors="coerce")
+
+        work_df["TRAMO_DIF_VIG"] = np.where(
+            work_df["DIF_VIGENCIA"].isna(), "",
+            np.select(
+                [
+                    work_df["DIF_VIGENCIA"] < 10,
+                    (work_df["DIF_VIGENCIA"] >= 10) & (work_df["DIF_VIGENCIA"] < 20),
+                    (work_df["DIF_VIGENCIA"] >= 20) & (work_df["DIF_VIGENCIA"] < 31),
+                    (work_df["DIF_VIGENCIA"] >= 31) & (work_df["DIF_VIGENCIA"] < 46),
+                    (work_df["DIF_VIGENCIA"] >= 46) & (work_df["DIF_VIGENCIA"] < 60),
+                    (work_df["DIF_VIGENCIA"] >= 60) & (work_df["DIF_VIGENCIA"] < 90),
+                    (work_df["DIF_VIGENCIA"] >= 90) & (work_df["DIF_VIGENCIA"] < 180),
+                    (work_df["DIF_VIGENCIA"] >= 180) & (work_df["DIF_VIGENCIA"] < 365),
+                    work_df["DIF_VIGENCIA"] >= 365
+                ],
+                [
+                    "1. <10 dias",
+                    "2. 10-19 dias",
+                    "3. 20-30 dias",
+                    "4. 31-45 dias",
+                    "5. 46-59 dias",
+                    "6. 60-89 dias",
+                    "7. 90-179 dias",
+                    "8. 180-364 dias",
+                    "9. 365+ dias"
+                ],
+                default=""
+            )
+        )
 
     freq_cols_local = [c for c in [
         "COMUNA_PER", "CANAL_VENTA_SEG", "SUCURSAL_VENTA_SEG",
@@ -1829,7 +1869,10 @@ def run_suspicion_profile_block(
         "INTER_MULTI_CROSS"
     ] if c in work_df.columns]
 
-    sus_new_freq_local = [c for c in work_df.columns if c.endswith("__freq_fal_post") or c.endswith("__rare_fal_post")]
+    sus_new_freq_local = [
+        c for c in work_df.columns
+        if c.endswith("__freq_fal_post") or c.endswith("__rare_fal_post")
+    ]
 
     sus_new_cat_local = [c for c in [
         "COMUNA_PER",
@@ -1850,7 +1893,9 @@ def run_suspicion_profile_block(
     ] if c in work_df.columns]
 
     sus_baseline_features_local = sus_old_num_local.copy()
-    sus_extended_features_local = sus_old_num_local + sus_new_num_local + sus_new_freq_local + sus_new_cat_local
+    sus_extended_features_local = (
+        sus_old_num_local + sus_new_num_local + sus_new_freq_local + sus_new_cat_local
+    )
 
     print("Features baseline sospecha:", sus_baseline_features_local)
     print("Features extendidas sospecha:", len(sus_extended_features_local))
@@ -1859,11 +1904,19 @@ def run_suspicion_profile_block(
     X_sus_ext_local = work_df[sus_extended_features_local].copy()
 
     Xs_train_b, Xs_test_b, ys_train_b, ys_test_b = train_test_split(
-        X_sus_base_local, y_sus_local, test_size=0.3, random_state=random_state, stratify=y_sus_local
+        X_sus_base_local,
+        y_sus_local,
+        test_size=0.3,
+        random_state=random_state,
+        stratify=y_sus_local
     )
 
     Xs_train_e, Xs_test_e, ys_train_e, ys_test_e = train_test_split(
-        X_sus_ext_local, y_sus_local, test_size=0.3, random_state=random_state, stratify=y_sus_local
+        X_sus_ext_local,
+        y_sus_local,
+        test_size=0.3,
+        random_state=random_state,
+        stratify=y_sus_local
     )
 
     sus_preprocessor_base_local = ColumnTransformer(
@@ -1953,7 +2006,10 @@ def run_suspicion_profile_block(
 
     print("\n=== COMPARACIÓN MODELOS SOSPECHA ===")
     display(comparison_sus_local)
-    comparison_sus_local.to_csv(os.path.join(out_dir, f"comparison_modelos_sospecha_{out_suffix}.csv"), index=False)
+    comparison_sus_local.to_csv(
+        os.path.join(out_dir, f"comparison_modelos_sospecha_{out_suffix}.csv"),
+        index=False
+    )
 
     print_section(f"{block_prefix}.4) IMPORTANCIA DE VARIABLES - SOSPECHA")
 
@@ -1973,7 +2029,10 @@ def run_suspicion_profile_block(
     }).sort_values("importance_mean", ascending=False)
 
     display(perm_sus_df_local.head(30))
-    perm_sus_df_local.to_csv(os.path.join(out_dir, f"permutation_importance_sospecha_{out_suffix}.csv"), index=False)
+    perm_sus_df_local.to_csv(
+        os.path.join(out_dir, f"permutation_importance_sospecha_{out_suffix}.csv"),
+        index=False
+    )
 
     nuevas_vs_historicas_local = perm_sus_df_local[
         ~perm_sus_df_local["feature"].isin(sus_old_num_local)
@@ -1981,7 +2040,10 @@ def run_suspicion_profile_block(
 
     print("\n=== VARIABLES NUEVAS MÁS IMPORTANTES PARA SOSPECHA ===")
     display(nuevas_vs_historicas_local.head(20))
-    nuevas_vs_historicas_local.to_csv(os.path.join(out_dir, f"variables_nuevas_sospecha_{out_suffix}.csv"), index=False)
+    nuevas_vs_historicas_local.to_csv(
+        os.path.join(out_dir, f"variables_nuevas_sospecha_{out_suffix}.csv"),
+        index=False
+    )
 
     plt.figure(figsize=(10, 7))
     sns.barplot(data=nuevas_vs_historicas_local.head(15), y="feature", x="importance_mean")
@@ -2021,7 +2083,10 @@ def run_suspicion_profile_block(
         print(f"\n=== LIFT TABLE: {col} ===")
         tmp_table = suspicion_shift_table(work_df, col, id_col_=id_col, min_size=20, top_n=20)
         display(tmp_table)
-        tmp_table.to_csv(os.path.join(out_dir, f"sus_shift_{col}_{out_suffix}.csv"), index=False)
+        tmp_table.to_csv(
+            os.path.join(out_dir, f"sus_shift_{col}_{out_suffix}.csv"),
+            index=False
+        )
 
     print_section(f"{block_prefix}.7) ISOLATION FOREST - SOSPECHA / RAREZA INTERNA")
 
@@ -2104,7 +2169,10 @@ def run_suspicion_profile_block(
 
     top_sus_local = work_df.sort_values("score_sospecha_final", ascending=False)[cols_sus_review_local].head(300)
     display(top_sus_local.head(20))
-    top_sus_local.to_csv(os.path.join(out_dir, f"top300_sospechosos_{out_suffix}.csv"), index=False)
+    top_sus_local.to_csv(
+        os.path.join(out_dir, f"top300_sospechosos_{out_suffix}.csv"),
+        index=False
+    )
 
     print_section(f"{block_prefix}.9) PERFIL PROMEDIO: SOSPECHOSOS VS NO SOSPECHOSOS")
 
@@ -2118,10 +2186,14 @@ def run_suspicion_profile_block(
 
     profile_sus_local = work_df.groupby("y_sus")[compare_cols_sus_local].mean().T
     profile_sus_local.columns = ["NO_SOSPECHOSO", "SOSPECHOSO"]
-    profile_sus_local["DIFF_SOS_MINUS_NO"] = profile_sus_local["SOSPECHOSO"] - profile_sus_local["NO_SOSPECHOSO"]
+    profile_sus_local["DIFF_SOS_MINUS_NO"] = (
+        profile_sus_local["SOSPECHOSO"] - profile_sus_local["NO_SOSPECHOSO"]
+    )
 
     display(profile_sus_local.sort_values("DIFF_SOS_MINUS_NO", ascending=False))
-    profile_sus_local.to_csv(os.path.join(out_dir, f"perfil_sospechosos_vs_no_{out_suffix}.csv"))
+    profile_sus_local.to_csv(
+        os.path.join(out_dir, f"perfil_sospechosos_vs_no_{out_suffix}.csv")
+    )
 
     return {
         "data": work_df,
@@ -2130,7 +2202,6 @@ def run_suspicion_profile_block(
         "sus_extended_features": sus_extended_features_local,
         "freq_cols": freq_cols_local
     }
-
 
 
 
