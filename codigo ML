@@ -2613,3 +2613,345 @@ print("2) Usa validación temporal: entrena en meses anteriores y prueba en los 
 print("3) Prioriza utilidad operativa: precision@k, deciles, lift y recall acumulado.")
 print("4) El output principal es score_prod, no una clasificación binaria dura.")
 print("5) tramos_operativos_modelo_productivo.csv propone una primera segmentación para control formal.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# 11) VALIDACIÓN FINAL DEL SCORE PRODUCTIVO
+# Objetivo:
+# 1) comparar score vs reglas simples
+# 2) probar modelo reducido
+# 3) revisar estabilidad temporal
+# ============================================================
+
+print_section("11) VALIDACIÓN FINAL DEL SCORE PRODUCTIVO")
+
+# ============================================================
+# 11.1 Benchmark contra reglas simples
+# ============================================================
+print_section("11.1) BENCHMARK SCORE VS REGLAS SIMPLES")
+
+# Usamos el mismo universo productivo del bloque 10
+bench_df = prod_df.copy()
+
+# test set del split temporal del bloque 10
+bench_test = bench_df.loc[test_mask].copy()
+
+if bench_test.empty:
+    raise ValueError("bench_test está vacío. Revisa el split temporal del bloque 10.")
+
+# Scores simples / reglas simples
+# La idea es comparar si el score productivo realmente agrega valor
+# por sobre una priorización fácil de implementar.
+
+bench_test["score_rule_difvig"] = -pd.to_numeric(bench_test["DIF_VIGENCIA"], errors="coerce").fillna(999999)
+bench_test["score_rule_uso_tope"] = pd.to_numeric(bench_test["USO_TOPE"], errors="coerce").fillna(-999999)
+
+# Score combinado simple: zscore de DIF_VIGENCIA invertido + USO_TOPE
+bench_test["difvig_inv_z"] = zscore(-pd.to_numeric(bench_test["DIF_VIGENCIA"], errors="coerce").fillna(999999))
+bench_test["uso_tope_z"] = zscore(pd.to_numeric(bench_test["USO_TOPE"], errors="coerce").fillna(0))
+bench_test["score_rule_combo"] = 0.7 * bench_test["difvig_inv_z"] + 0.3 * bench_test["uso_tope_z"]
+
+# Score productivo ya calculado
+if "score_prod" not in bench_test.columns:
+    raise ValueError("No existe score_prod en bench_test. Revisa que el bloque 10 haya corrido completo.")
+
+benchmark_results = []
+
+benchmark_dict = {
+    "modelo_productivo": bench_test["score_prod"],
+    "regla_dif_vigencia": bench_test["score_rule_difvig"],
+    "regla_uso_tope": bench_test["score_rule_uso_tope"],
+    "regla_combo_difvig_uso_tope": bench_test["score_rule_combo"]
+}
+
+for name, scores in benchmark_dict.items():
+    auc_val = roc_auc_score(bench_test["y_prod"], scores)
+    prauc_val = average_precision_score(bench_test["y_prod"], scores)
+
+    row = {
+        "modelo": name,
+        "auc_test": auc_val,
+        "pr_auc_test": prauc_val
+    }
+
+    for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+        k_n = max(1, int(len(bench_test) * frac))
+        row[f"precision_top_{int(frac*100)}pct"] = precision_at_k(
+            bench_test["y_prod"].reset_index(drop=True),
+            pd.Series(scores).reset_index(drop=True),
+            k_n
+        )
+
+    benchmark_results.append(row)
+
+benchmark_df = pd.DataFrame(benchmark_results).sort_values(["pr_auc_test", "auc_test"], ascending=False)
+
+display(benchmark_df)
+benchmark_df.to_csv(os.path.join(OUT_DIR, "benchmark_modelo_vs_reglas_simples.csv"), index=False)
+
+# ============================================================
+# 11.2 Modelo reducido (parsimonioso)
+# ============================================================
+print_section("11.2) MODELO REDUCIDO")
+
+# Solo dejamos variables que sí parecieron aportar en el bloque 10
+reduced_num_features = [c for c in [
+    "DIF_VIGENCIA",
+    "USO_TOPE",
+    "EDAD_AL_SINIESTRO",
+    "N_SEG_12M_PRE_OCURR"
+] if c in prod_df.columns]
+
+reduced_cat_features = [c for c in [
+    "COMUNA_PER",
+    "MEDIO_PAGO_SEG"
+] if c in prod_df.columns]
+
+reduced_features = reduced_num_features + reduced_cat_features
+
+print("Features modelo reducido:")
+print(reduced_features)
+
+X_prod_reduced = prod_df[reduced_features].copy()
+
+X_train_red = X_prod_reduced.loc[train_mask].copy()
+X_test_red = X_prod_reduced.loc[test_mask].copy()
+
+reduced_preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline([
+            ("imputer", SimpleImputer(strategy="median"))
+        ]), reduced_num_features),
+        ("cat", Pipeline([
+            ("imputer", SimpleImputer(strategy="constant", fill_value="MISSING")),
+            ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))
+        ]), reduced_cat_features)
+    ],
+    remainder="drop"
+)
+
+reduced_model = HistGradientBoostingClassifier(
+    learning_rate=0.03,
+    max_iter=200,
+    max_depth=3,
+    min_samples_leaf=60,
+    l2_regularization=3.0,
+    random_state=RANDOM_STATE
+)
+
+clf_prod_reduced = Pipeline([
+    ("preprocessor", reduced_preprocessor),
+    ("model", reduced_model)
+])
+
+sw_reduced = compute_sample_weight(class_weight="balanced", y=y_train_prod)
+clf_prod_reduced.fit(X_train_red, y_train_prod, model__sample_weight=sw_reduced)
+
+pred_train_red = clf_prod_reduced.predict_proba(X_train_red)[:, 1]
+pred_test_red = clf_prod_reduced.predict_proba(X_test_red)[:, 1]
+
+reduced_comparison = pd.DataFrame({
+    "modelo": ["productivo_completo", "productivo_reducido"],
+    "auc_train": [
+        roc_auc_score(y_train_prod, pred_train_prod),
+        roc_auc_score(y_train_prod, pred_train_red)
+    ],
+    "auc_test": [
+        roc_auc_score(y_test_prod, pred_test_prod),
+        roc_auc_score(y_test_prod, pred_test_red)
+    ],
+    "pr_auc_train": [
+        average_precision_score(y_train_prod, pred_train_prod),
+        average_precision_score(y_train_prod, pred_train_red)
+    ],
+    "pr_auc_test": [
+        average_precision_score(y_test_prod, pred_test_prod),
+        average_precision_score(y_test_prod, pred_test_red)
+    ]
+})
+
+display(reduced_comparison)
+reduced_comparison.to_csv(os.path.join(OUT_DIR, "comparacion_modelo_productivo_vs_reducido.csv"), index=False)
+
+# score reducido sobre todo el universo productivo
+prod_df["score_prod_reduced"] = clf_prod_reduced.predict_proba(X_prod_reduced)[:, 1]
+
+# precisión top-k del reducido
+reduced_topk = []
+for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+    k_n = max(1, int(len(X_test_red) * frac))
+    reduced_topk.append({
+        "pct_revisado": frac,
+        "n_revisado": k_n,
+        "precision_modelo_completo": precision_at_k(
+            y_test_prod.reset_index(drop=True),
+            pd.Series(pred_test_prod),
+            k_n
+        ),
+        "precision_modelo_reducido": precision_at_k(
+            y_test_prod.reset_index(drop=True),
+            pd.Series(pred_test_red),
+            k_n
+        )
+    })
+
+reduced_topk_df = pd.DataFrame(reduced_topk)
+display(reduced_topk_df)
+reduced_topk_df.to_csv(os.path.join(OUT_DIR, "precision_topk_completo_vs_reducido.csv"), index=False)
+
+# ============================================================
+# 11.3 Backtesting temporal
+# ============================================================
+print_section("11.3) BACKTESTING TEMPORAL")
+
+bt_df = prod_df.copy()
+bt_months = sorted(bt_df["year_month"].dropna().unique())
+
+if len(bt_months) < 6:
+    print("Muy pocos meses para backtesting robusto. Se omite.")
+    backtest_df = pd.DataFrame()
+else:
+    backtest_rows = []
+
+    # usamos ventanas crecientes:
+    # entrenar hasta t-1 y probar en t
+    # partimos desde el mes 4 para que haya historia mínima
+    for i in range(4, len(bt_months)):
+        test_month = bt_months[i]
+        train_months_bt = bt_months[:i]
+
+        train_bt = bt_df[bt_df["year_month"].isin(train_months_bt)].copy()
+        test_bt = bt_df[bt_df["year_month"] == test_month].copy()
+
+        if train_bt["y_prod"].nunique() < 2:
+            continue
+        if test_bt["y_prod"].nunique() < 2:
+            continue
+        if len(test_bt) < 10:
+            continue
+
+        X_train_bt = train_bt[reduced_features].copy()
+        y_train_bt = train_bt["y_prod"].astype(int)
+
+        X_test_bt = test_bt[reduced_features].copy()
+        y_test_bt = test_bt["y_prod"].astype(int)
+
+        bt_model = Pipeline([
+            ("preprocessor", reduced_preprocessor),
+            ("model", HistGradientBoostingClassifier(
+                learning_rate=0.03,
+                max_iter=200,
+                max_depth=3,
+                min_samples_leaf=60,
+                l2_regularization=3.0,
+                random_state=RANDOM_STATE
+            ))
+        ])
+
+        sw_bt = compute_sample_weight(class_weight="balanced", y=y_train_bt)
+        bt_model.fit(X_train_bt, y_train_bt, model__sample_weight=sw_bt)
+
+        pred_bt = bt_model.predict_proba(X_test_bt)[:, 1]
+
+        row = {
+            "test_month": test_month,
+            "n_test": len(test_bt),
+            "tasa_sospecha_test": y_test_bt.mean(),
+            "auc_test": roc_auc_score(y_test_bt, pred_bt),
+            "pr_auc_test": average_precision_score(y_test_bt, pred_bt)
+        }
+
+        for frac in [0.05, 0.10, 0.20]:
+            k_n = max(1, int(len(test_bt) * frac))
+            row[f"precision_top_{int(frac*100)}pct"] = precision_at_k(
+                y_test_bt.reset_index(drop=True),
+                pd.Series(pred_bt),
+                k_n
+            )
+
+        backtest_rows.append(row)
+
+    backtest_df = pd.DataFrame(backtest_rows)
+
+    display(backtest_df)
+    backtest_df.to_csv(os.path.join(OUT_DIR, "backtesting_temporal_modelo_reducido.csv"), index=False)
+
+    if not backtest_df.empty:
+        plt.figure(figsize=(10, 5))
+        plt.plot(backtest_df["test_month"], backtest_df["pr_auc_test"], marker="o", label="PR-AUC")
+        plt.plot(backtest_df["test_month"], backtest_df["auc_test"], marker="o", label="AUC")
+        plt.xticks(rotation=45)
+        plt.title("Backtesting temporal - modelo reducido")
+        plt.xlabel("Mes test")
+        plt.ylabel("Métrica")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+# ============================================================
+# 11.4 Recomendación preliminar de modelo a congelar
+# ============================================================
+print_section("11.4) RECOMENDACIÓN PRELIMINAR")
+
+# comparar benchmark completo vs reducido
+modelo_recomendado = "POR DEFINIR"
+
+full_pr = roc_auc_score(y_test_prod, pred_test_prod)
+red_pr = roc_auc_score(y_test_prod, pred_test_red)
+
+full_prauc = average_precision_score(y_test_prod, pred_test_prod)
+red_prauc = average_precision_score(y_test_prod, pred_test_red)
+
+if red_prauc >= full_prauc - 0.02:
+    modelo_recomendado = "MODELO REDUCIDO"
+else:
+    modelo_recomendado = "MODELO COMPLETO"
+
+print("Modelo recomendado preliminarmente:", modelo_recomendado)
+print("Criterio usado: preferir parsimonia si la pérdida de PR-AUC test es menor o igual a 0.02")
+
+summary_final_model = pd.DataFrame({
+    "modelo": ["completo", "reducido"],
+    "auc_test": [roc_auc_score(y_test_prod, pred_test_prod), roc_auc_score(y_test_prod, pred_test_red)],
+    "pr_auc_test": [average_precision_score(y_test_prod, pred_test_prod), average_precision_score(y_test_prod, pred_test_red)]
+})
+
+display(summary_final_model)
+summary_final_model.to_csv(os.path.join(OUT_DIR, "resumen_final_modelos_candidatos.csv"), index=False)
+
+# ============================================================
+# 11.5 Resumen del bloque
+# ============================================================
+print_section("11.5) RESUMEN BLOQUE 11")
+print("1) benchmark_modelo_vs_reglas_simples.csv compara el score contra reglas fáciles de implementar.")
+print("2) comparacion_modelo_productivo_vs_reducido.csv compara modelo completo vs reducido.")
+print("3) precision_topk_completo_vs_reducido.csv compara utilidad operativa directa.")
+print("4) backtesting_temporal_modelo_reducido.csv mide estabilidad mes a mes.")
+print("5) resumen_final_modelos_candidatos.csv resume qué modelo conviene congelar preliminarmente.")
