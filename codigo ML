@@ -1163,67 +1163,96 @@ display(fal_df.head(3))
 # -----------------------------
 # 8.2 Features derivadas nuevas
 # -----------------------------
-print_section("8.2) FEATURES DERIVADAS NUEVAS")
+def add_suspicion_features(data):
+    out = data.copy()
 
-# Numéricos seguros
-for c in [
-    "DIF_VIGENCIA", "USO_TOPE", "COUNT_OF_NUMERO_FINAL", "CUENTA_SIN_FAMILIAR_AUX",
-    "N_SEG_12M_PRE_OCURR", "N_SIN_OTRAS_COB", "MONTO_FINAL_UF", "EDAD_AL_SINIESTRO"
-]:
-    if c in fal_df.columns:
-        fal_df[c] = pd.to_numeric(fal_df[c], errors="coerce")
+    # Numéricos
+    for c in [
+        "DIF_VIGENCIA", "USO_TOPE", "COUNT_OF_NUMERO_FINAL", "CUENTA_SIN_FAMILIAR_AUX",
+        "N_SEG_12M_PRE_OCURR", "N_SIN_OTRAS_COB", "MONTO_FINAL_UF", "EDAD_AL_SINIESTRO"
+    ]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
 
-# 1) Interacciones simples
-if {"DIF_VIGENCIA", "USO_TOPE"}.issubset(fal_df.columns):
-    fal_df["INTER_DIFXTOPE"] = fal_df["DIF_VIGENCIA"] * fal_df["USO_TOPE"]
+    # Categóricas relevantes
+    for c in [
+        "COMUNA_PER", "CANAL_VENTA_SEG", "SUCURSAL_VENTA_SEG", "MEDIO_PAGO_SEG",
+        "FRECUENCIA_PAGO", "PLAN_AUX", "COB", "GLOSA_GIRO_PER",
+        "TRAMO_DIF_VIG", "TRAMO_USO_TOPE", "TRAMO_EDAD", "AGRUPACION_QS"
+    ]:
+        if c in out.columns:
+            safe_upper_col(out, c)
 
-if {"COUNT_OF_NUMERO_FINAL", "CUENTA_SIN_FAMILIAR_AUX"}.issubset(fal_df.columns):
-    fal_df["INTER_REPEAT_FAM"] = fal_df["COUNT_OF_NUMERO_FINAL"].fillna(0) * fal_df["CUENTA_SIN_FAMILIAR_AUX"].fillna(0)
+    # 1) Interacciones
+    if {"DIF_VIGENCIA", "USO_TOPE"}.issubset(out.columns):
+        out["INTER_DIFXTOPE"] = out["DIF_VIGENCIA"] * out["USO_TOPE"]
 
-if {"N_SEG_12M_PRE_OCURR", "N_SIN_OTRAS_COB"}.issubset(fal_df.columns):
-    fal_df["INTER_MULTI_CROSS"] = fal_df["N_SEG_12M_PRE_OCURR"].fillna(0) * fal_df["N_SIN_OTRAS_COB"].fillna(0)
+    if {"COUNT_OF_NUMERO_FINAL", "CUENTA_SIN_FAMILIAR_AUX"}.issubset(out.columns):
+        out["INTER_REPEAT_FAM"] = (
+            out["COUNT_OF_NUMERO_FINAL"].fillna(0) * out["CUENTA_SIN_FAMILIAR_AUX"].fillna(0)
+        )
 
-# 2) Buckets operativos de DIF_VIGENCIA
-if "DIF_VIGENCIA" in fal_df.columns:
-    fal_df["FLAG_0_10D"] = ((fal_df["DIF_VIGENCIA"] >= 0) & (fal_df["DIF_VIGENCIA"] <= 10)).astype(int)
-    fal_df["FLAG_11_30D"] = ((fal_df["DIF_VIGENCIA"] >= 11) & (fal_df["DIF_VIGENCIA"] <= 30)).astype(int)
-    fal_df["FLAG_31_45D"] = ((fal_df["DIF_VIGENCIA"] >= 31) & (fal_df["DIF_VIGENCIA"] <= 45)).astype(int)
-    fal_df["FLAG_46_60D"] = ((fal_df["DIF_VIGENCIA"] >= 46) & (fal_df["DIF_VIGENCIA"] <= 60)).astype(int)
-    fal_df["FLAG_0_30D"] = ((fal_df["DIF_VIGENCIA"] >= 0) & (fal_df["DIF_VIGENCIA"] <= 30)).astype(int)
-    fal_df["FLAG_0_45D"] = ((fal_df["DIF_VIGENCIA"] >= 0) & (fal_df["DIF_VIGENCIA"] <= 45)).astype(int)
+    if {"N_SEG_12M_PRE_OCURR", "N_SIN_OTRAS_COB"}.issubset(out.columns):
+        out["INTER_MULTI_CROSS"] = (
+            out["N_SEG_12M_PRE_OCURR"].fillna(0) * out["N_SIN_OTRAS_COB"].fillna(0)
+        )
 
-# 3) Buckets operativos de USO_TOPE
-if "USO_TOPE" in fal_df.columns:
-    fal_df["FLAG_TOPE_70_79"] = ((fal_df["USO_TOPE"] >= 0.70) & (fal_df["USO_TOPE"] < 0.80)).astype(int)
-    fal_df["FLAG_TOPE_80_89"] = ((fal_df["USO_TOPE"] >= 0.80) & (fal_df["USO_TOPE"] < 0.90)).astype(int)
-    fal_df["FLAG_TOPE_90P"] = (fal_df["USO_TOPE"] >= 0.90).astype(int)
+    # 2) Buckets DIF_VIGENCIA
+    if "DIF_VIGENCIA" in out.columns:
+        out["FLAG_0_10D"] = ((out["DIF_VIGENCIA"] >= 0) & (out["DIF_VIGENCIA"] <= 10)).astype(int)
+        out["FLAG_11_30D"] = ((out["DIF_VIGENCIA"] >= 11) & (out["DIF_VIGENCIA"] <= 30)).astype(int)
+        out["FLAG_31_45D"] = ((out["DIF_VIGENCIA"] >= 31) & (out["DIF_VIGENCIA"] <= 45)).astype(int)
+        out["FLAG_46_60D"] = ((out["DIF_VIGENCIA"] >= 46) & (out["DIF_VIGENCIA"] <= 60)).astype(int)
+        out["FLAG_0_30D"] = ((out["DIF_VIGENCIA"] >= 0) & (out["DIF_VIGENCIA"] <= 30)).astype(int)
+        out["FLAG_0_45D"] = ((out["DIF_VIGENCIA"] >= 0) & (out["DIF_VIGENCIA"] <= 45)).astype(int)
 
-# 4) Flags compuestos más agresivos
-flag_inputs = [c for c in [
-    "FLAG_EVASION_DIF31_45", "FLAG_EVASION_TOPE_75_80",
-    "FLAG_MULTI_SEGURO", "FLAG_SIN_CRUZADA"
-] if c in fal_df.columns]
+    # 3) Buckets USO_TOPE
+    if "USO_TOPE" in out.columns:
+        out["FLAG_TOPE_70_79"] = ((out["USO_TOPE"] >= 0.70) & (out["USO_TOPE"] < 0.80)).astype(int)
+        out["FLAG_TOPE_80_89"] = ((out["USO_TOPE"] >= 0.80) & (out["USO_TOPE"] < 0.90)).astype(int)
+        out["FLAG_TOPE_90P"] = (out["USO_TOPE"] >= 0.90).astype(int)
 
-for c in flag_inputs:
-    fal_df[c] = pd.to_numeric(fal_df[c], errors="coerce").fillna(0).astype(int)
+    # 4) Flags base
+    for c in [
+        "FLAG_EVASION_DIF31_45", "FLAG_EVASION_TOPE_75_80",
+        "FLAG_MULTI_SEGURO", "FLAG_SIN_CRUZADA"
+    ]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(int)
 
-if {"FLAG_EVASION_DIF31_45", "FLAG_EVASION_TOPE_75_80"}.issubset(fal_df.columns):
-    fal_df["FLAG_EVASION_SOFT"] = (
-        (fal_df["FLAG_EVASION_DIF31_45"] == 1) |
-        (fal_df["FLAG_EVASION_TOPE_75_80"] == 1)
-    ).astype(int)
+    if {"FLAG_EVASION_DIF31_45", "FLAG_EVASION_TOPE_75_80"}.issubset(out.columns):
+        out["FLAG_EVASION_SOFT"] = (
+            (out["FLAG_EVASION_DIF31_45"] == 1) |
+            (out["FLAG_EVASION_TOPE_75_80"] == 1)
+        ).astype(int)
 
-if {"FLAG_MULTI_SEGURO", "FLAG_SIN_CRUZADA"}.issubset(fal_df.columns):
-    fal_df["FLAG_COMPLEJIDAD_OPERATIVA"] = (
-        (fal_df["FLAG_MULTI_SEGURO"] == 1) |
-        (fal_df["FLAG_SIN_CRUZADA"] == 1)
-    ).astype(int)
+    if {"FLAG_MULTI_SEGURO", "FLAG_SIN_CRUZADA"}.issubset(out.columns):
+        out["FLAG_COMPLEJIDAD_OPERATIVA"] = (
+            (out["FLAG_MULTI_SEGURO"] == 1) |
+            (out["FLAG_SIN_CRUZADA"] == 1)
+        ).astype(int)
 
-if {"FLAG_EVASION_SOFT", "FLAG_COMPLEJIDAD_OPERATIVA"}.issubset(fal_df.columns):
-    fal_df["FLAG_EVASION_Y_COMPLEJIDAD"] = (
-        (fal_df["FLAG_EVASION_SOFT"] == 1) &
-        (fal_df["FLAG_COMPLEJIDAD_OPERATIVA"] == 1)
-    ).astype(int)
+    if {"FLAG_EVASION_SOFT", "FLAG_COMPLEJIDAD_OPERATIVA"}.issubset(out.columns):
+        out["FLAG_EVASION_Y_COMPLEJIDAD"] = (
+            (out["FLAG_EVASION_SOFT"] == 1) &
+            (out["FLAG_COMPLEJIDAD_OPERATIVA"] == 1)
+        ).astype(int)
+
+    # 5) Clusters
+    if {"COMUNA_PER", "SUCURSAL_VENTA_SEG"}.issubset(out.columns):
+        out["cluster_comuna_sucursal"] = out["COMUNA_PER"] + "|" + out["SUCURSAL_VENTA_SEG"]
+
+    if {"COMUNA_PER", "MEDIO_PAGO_SEG"}.issubset(out.columns):
+        out["cluster_comuna_medio"] = out["COMUNA_PER"] + "|" + out["MEDIO_PAGO_SEG"]
+
+    if {"PLAN_AUX", "COB"}.issubset(out.columns):
+        out["cluster_plan_cob"] = out["PLAN_AUX"] + "|" + out["COB"]
+
+    if {"CANAL_VENTA_SEG", "MEDIO_PAGO_SEG"}.issubset(out.columns):
+        out["cluster_canal_pago"] = out["CANAL_VENTA_SEG"] + "|" + out["MEDIO_PAGO_SEG"]
+
+    return out
+fal_df = add_suspicion_features(fal_df)
 
 # 5) Rareza categórica dentro de Falabella post-break
 def add_frequency_features_local(data, cols):
@@ -1257,21 +1286,6 @@ freq_cols = [c for c in [
 ] if c in fal_df.columns]
 
 fal_df = add_frequency_features_local(fal_df, freq_cols)
-
-# 6) Clusters operativos específicos del segmento
-if {"COMUNA_PER", "SUCURSAL_VENTA_SEG"}.issubset(fal_df.columns):
-    fal_df["cluster_comuna_sucursal"] = fal_df["COMUNA_PER"] + "|" + fal_df["SUCURSAL_VENTA_SEG"]
-
-if {"COMUNA_PER", "MEDIO_PAGO_SEG"}.issubset(fal_df.columns):
-    fal_df["cluster_comuna_medio"] = fal_df["COMUNA_PER"] + "|" + fal_df["MEDIO_PAGO_SEG"]
-
-if {"PLAN_AUX", "COB"}.issubset(fal_df.columns):
-    fal_df["cluster_plan_cob"] = fal_df["PLAN_AUX"] + "|" + fal_df["COB"]
-
-if {"CANAL_VENTA_SEG", "MEDIO_PAGO_SEG"}.issubset(fal_df.columns):
-    fal_df["cluster_canal_pago"] = fal_df["CANAL_VENTA_SEG"] + "|" + fal_df["MEDIO_PAGO_SEG"]
-
-print("Columnas disponibles después de feature engineering:", fal_df.shape[1])
 
 # -----------------------------
 # 8.3 Modelaje supervisado: sospecha en Falabella post-break
@@ -1651,14 +1665,36 @@ print_section("8.10) EXTRAPOLACIÓN DEL PERFIL A OTROS SOCIOS")
 
 if "AGRUPACION_QS" in df.columns:
     compare_all = df.copy()
+    compare_all = add_suspicion_features(compare_all)
     safe_upper_col(compare_all, "AGRUPACION_QS")
 
-    for c in sus_cat_ext:
-        safe_upper_col(compare_all, c)
+    # crear columnas de frecuencia usando el universo Falabella post-break
+    for c in freq_cols:
+        if c in compare_all.columns and c in fal_df.columns:
+            freq_map = (
+                fal_df[c]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .value_counts(normalize=True)
+            )
+            compare_all[f"{c}__freq_fal_post"] = (
+                compare_all[c]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .map(freq_map)
+                .fillna(0)
+            )
+            compare_all[f"{c}__rare_fal_post"] = 1 - compare_all[f"{c}__freq_fal_post"]
 
-    for c in sus_num_ext:
-        if c in compare_all.columns:
-            compare_all[c] = pd.to_numeric(compare_all[c], errors="coerce")
+    missing_features = [c for c in sus_extended_features if c not in compare_all.columns]
+    print("Missing features:", missing_features)
+
+    if missing_features:
+        raise ValueError(f"Faltan columnas en compare_all para scorear el modelo: {missing_features}")
 
     compare_all["score_sospecha_falabella_model"] = clf_sus_ext.predict_proba(
         compare_all[sus_extended_features]
