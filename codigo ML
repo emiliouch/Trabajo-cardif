@@ -4760,7 +4760,54 @@ print("4) tramos_operativos_hibrido_glm.csv propone segmentación de riesgo para
 
 
 
+DIF_VIGENCIA
 
+DIF_VIGENCIA es la diferencia entre la fecha de otorgamiento del seguro y la fecha de ocurrencia del siniestro.
+
+Mientras menor es esta diferencia, más temprano ocurrió el siniestro después de contratar el seguro.
+
+SOSPECHA_FINAL
+
+SOSPECHA_FINAL es una variable operativa construida a partir de reglas de negocio.
+Resume cuántas señales de sospecha cumple un caso.
+
+No equivale a fraude confirmado, sino a una alerta operativa.
+
+AUC
+
+El AUC mide qué tan bien un modelo ordena los casos de mayor a menor riesgo.
+	•	0.5 equivale a ordenar al azar
+	•	mientras más se acerca a 1, mejor separa casos sospechosos de no sospechosos
+
+PR-AUC
+
+El PR-AUC mide qué tan bien el modelo identifica casos sospechosos cuando estos son pocos.
+
+En este estudio fue especialmente importante porque los casos sospechosos son minoritarios.
+
+Precision@k
+
+La precision@k indica qué proporción de casos sospechosos aparece dentro del porcentaje superior del ranking.
+
+Ejemplo:
+	•	precision_top_10% = 0.40 significa que, si revisamos el 10% de casos con mayor score, el 40% de ellos corresponde a casos sospechosos.
+
+Recall
+
+El recall mide qué porcentaje de todos los casos sospechosos logra capturar el sistema.
+
+Lift
+
+El lift muestra cuánto más concentrado está el riesgo en un segmento respecto del promedio general.
+
+Ejemplo:
+	•	un lift de 3 significa que ese grupo tiene tres veces más concentración de casos sospechosos que el promedio.
+
+Score
+
+El score es un puntaje de riesgo.
+
+Mientras más alto sea, mayor es la prioridad de revisión del caso.
 
 1. Punto de partida
 
