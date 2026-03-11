@@ -2152,8 +2152,85 @@ resultado_fal_robo = run_suspicion_profile_block(
     random_state=RANDOM_STATE,
     cobertura_objetivo="COMPRA PROTEGIDA X ROBO"
 )
+# -----------------------------
+# 9.10 Extrapolación comparativa a otros socios
+# usando el modelo específico de COB = COMPRA PROTEGIDA X ROBO
+# -----------------------------
+print_section("9.10) EXTRAPOLACIÓN DEL PERFIL A OTROS SOCIOS | COB = COMPRA PROTEGIDA X ROBO")
 
+if "AGRUPACION_QS" in df.columns:
+    compare_all_robo = df.copy()
+    compare_all_robo = add_suspicion_features(compare_all_robo)
+
+    safe_upper_col(compare_all_robo, "AGRUPACION_QS")
+    safe_upper_col(compare_all_robo, "COB")
+
+    # mismo filtro de cobertura del bloque 9
+    compare_all_robo = compare_all_robo[
+        compare_all_robo["COB"] == "COMPRA PROTEGIDA X ROBO"
+    ].copy()
+
+    # frecuencias calculadas usando el universo entrenado en bloque 9
+    fal_robo_train_df = resultado_fal_robo["data"]
+    freq_cols_robo = resultado_fal_robo["freq_cols"]
+
+    for c in freq_cols_robo:
+        if c in compare_all_robo.columns and c in fal_robo_train_df.columns:
+            freq_map = (
+                fal_robo_train_df[c]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .value_counts(normalize=True)
+            )
+            compare_all_robo[f"{c}__freq_fal_post"] = (
+                compare_all_robo[c]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .map(freq_map)
+                .fillna(0)
+            )
+            compare_all_robo[f"{c}__rare_fal_post"] = 1 - compare_all_robo[f"{c}__freq_fal_post"]
+
+    sus_extended_features_robo = resultado_fal_robo["sus_extended_features"]
+    clf_sus_ext_robo = resultado_fal_robo["clf_ext"]
+
+    missing_features_robo = [c for c in sus_extended_features_robo if c not in compare_all_robo.columns]
+    print("Missing features (robo):", missing_features_robo)
+
+    if missing_features_robo:
+        raise ValueError(
+            f"Faltan columnas en compare_all_robo para scorear el modelo de robo: {missing_features_robo}"
+        )
+
+    compare_all_robo["score_sospecha_falabella_robo_model"] = clf_sus_ext_robo.predict_proba(
+        compare_all_robo[sus_extended_features_robo]
+    )[:, 1]
+
+    extrap_robo = (
+        compare_all_robo
+        .groupby("AGRUPACION_QS")
+        .agg(
+            n=(id_col, "count"),
+            avg_score=("score_sospecha_falabella_robo_model", "mean"),
+            p90_score=("score_sospecha_falabella_robo_model", lambda x: x.quantile(0.9)),
+            pct_top10=("score_sospecha_falabella_robo_model",
+                       lambda x: (x >= compare_all_robo["score_sospecha_falabella_robo_model"].quantile(0.9)).mean())
+        )
+        .reset_index()
+        .sort_values(["avg_score", "p90_score"], ascending=False)
+    )
+
+    display(extrap_robo.head(20))
+    extrap_robo.to_csv(
+        os.path.join(OUT_DIR, "extrapolacion_modelo_falabella_robo_a_otros_socios.csv"),
+        index=False
+    )
 print_section("9.11) RESUMEN BLOQUE COB ESPECÍFICO")
 print("1) Este bloque repite el análisis de sospecha, pero restringido a COB = COMPRA PROTEGIDA X ROBO.")
 print("2) Sirve para ver si el perfil sospechoso dentro de Falabella se intensifica o cambia en esta cobertura específica.")
 print("3) Los outputs quedan guardados con sufijo: falabella_robo_post_sep2024.")
+print("4) extrapolacion_modelo_falabella_robo_a_otros_socios.csv compara ese perfil específico contra otros socios en la misma cobertura.")
