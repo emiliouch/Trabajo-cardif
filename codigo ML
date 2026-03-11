@@ -3873,3 +3873,433 @@ print("2) glm_coef_odds_ratios.csv entrega coeficientes, odds ratios y p-values.
 print("3) benchmark_glm_vs_reglas.csv compara GLM contra DIF_VIGENCIA y el modelo previo.")
 print("4) deciles_glm_productivo_test.csv y coverage_glm_productivo_test.csv muestran utilidad operativa.")
 print("5) tramos_operativos_glm.csv propone segmentación de riesgo usando el score GLM.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# 14) GLM ESTABILIZADO
+# Objetivo:
+# estabilizar el GLM productivo mediante:
+# - colapso más agresivo de categorías
+# - menos variables categóricas
+# - regularización
+# ============================================================
+
+print_section("14) GLM ESTABILIZADO")
+
+import statsmodels.api as sm
+
+# ============================================================
+# 14.1 Universo productivo
+# ============================================================
+glm2_df = df.copy()
+glm2_df = add_suspicion_features(glm2_df)
+
+safe_upper_col(glm2_df, "AGRUPACION_QS")
+safe_upper_col(glm2_df, "COB")
+
+glm2_df = glm2_df[
+    (glm2_df["AGRUPACION_QS"] == "FALABELLA") &
+    (glm2_df["FEC_OCURRENCIA_FINAL"] >= BREAK_DATE) &
+    (glm2_df["COB"] == "COMPRA PROTEGIDA X ROBO")
+].copy()
+
+if glm2_df.empty:
+    raise ValueError("No hay registros para el universo GLM estabilizado.")
+
+glm2_df["y_glm2"] = (glm2_df["SOSPECHA_FINAL"].fillna(0) >= 2).astype(int)
+glm2_df["year_month"] = glm2_df["FEC_OCURRENCIA_FINAL"].dt.to_period("M").astype(str)
+
+print("Shape universo GLM2:", glm2_df.shape)
+print("Tasa y_glm2:", round(glm2_df["y_glm2"].mean(), 4))
+display(glm2_df.head(3))
+
+# ============================================================
+# 14.2 Features más parsimoniosas
+# ============================================================
+print_section("14.2) FEATURES GLM ESTABILIZADO")
+
+glm2_num_features = [c for c in [
+    "DIF_VIGENCIA",
+    "USO_TOPE",
+    "EDAD_AL_SINIESTRO",
+    "N_SEG_12M_PRE_OCURR",
+    "COUNT_OF_NUMERO_FINAL",
+    "CUENTA_SIN_FAMILIAR_AUX"
+] if c in glm2_df.columns]
+
+# Solo una o dos categóricas fuertes
+glm2_cat_features = [c for c in [
+    "PLAN_AUX",
+    "COMUNA_PER"
+] if c in glm2_df.columns]
+
+glm2_features = glm2_num_features + glm2_cat_features
+
+print("Features GLM2:")
+print(glm2_features)
+
+# ============================================================
+# 14.3 Split temporal
+# ============================================================
+print_section("14.3) SPLIT TEMPORAL GLM2")
+
+glm2_months = sorted(glm2_df["year_month"].dropna().unique())
+if len(glm2_months) < 6:
+    raise ValueError(f"Hay muy pocos meses ({len(glm2_months)}) para validación temporal GLM2.")
+
+glm2_test_months = glm2_months[-3:]
+glm2_train_months = glm2_months[:-3]
+
+glm2_df["is_test_time_glm2"] = glm2_df["year_month"].isin(glm2_test_months).astype(int)
+
+glm2_train_mask = glm2_df["is_test_time_glm2"] == 0
+glm2_test_mask = glm2_df["is_test_time_glm2"] == 1
+
+glm2_train = glm2_df.loc[glm2_train_mask].copy()
+glm2_test = glm2_df.loc[glm2_test_mask].copy()
+
+print("Meses train GLM2:", glm2_train_months)
+print("Meses test GLM2 :", glm2_test_months)
+print("Train shape:", glm2_train.shape, "| tasa sospecha:", round(glm2_train["y_glm2"].mean(), 4))
+print("Test shape :", glm2_test.shape, "| tasa sospecha:", round(glm2_test["y_glm2"].mean(), 4))
+
+# ============================================================
+# 14.4 Preparación matriz estabilizada
+# - top 5 categorías
+# - una sola interacción
+# - cast a float
+# ============================================================
+print_section("14.4) MATRIZ GLM2")
+
+def collapse_rare_categories_stable(train_df, test_df, cols, top_n=5):
+    train_out = train_df.copy()
+    test_out = test_df.copy()
+
+    for c in cols:
+        if c not in train_out.columns:
+            continue
+
+        train_out[c] = train_out[c].fillna("MISSING").astype(str).str.strip().str.upper()
+        test_out[c] = test_out[c].fillna("MISSING").astype(str).str.strip().str.upper()
+
+        top_levels = train_out[c].value_counts().head(top_n).index.tolist()
+
+        train_out[c] = np.where(train_out[c].isin(top_levels), train_out[c], "OTROS")
+        test_out[c] = np.where(test_out[c].isin(top_levels), test_out[c], "OTROS")
+
+    return train_out, test_out
+
+glm2_train_prep = glm2_train.copy()
+glm2_test_prep = glm2_test.copy()
+
+# numéricas
+for c in glm2_num_features:
+    glm2_train_prep[c] = pd.to_numeric(glm2_train_prep[c], errors="coerce")
+    glm2_test_prep[c] = pd.to_numeric(glm2_test_prep[c], errors="coerce")
+    med = glm2_train_prep[c].median()
+    glm2_train_prep[c] = glm2_train_prep[c].fillna(med)
+    glm2_test_prep[c] = glm2_test_prep[c].fillna(med)
+
+# colapso más agresivo
+glm2_train_prep, glm2_test_prep = collapse_rare_categories_stable(
+    glm2_train_prep, glm2_test_prep, glm2_cat_features, top_n=5
+)
+
+# interacción controlada
+glm2_num_features_final = glm2_num_features.copy()
+if {"DIF_VIGENCIA", "USO_TOPE"}.issubset(glm2_train_prep.columns):
+    glm2_train_prep["INTER_DIFXTOPE_GLM2"] = glm2_train_prep["DIF_VIGENCIA"] * glm2_train_prep["USO_TOPE"]
+    glm2_test_prep["INTER_DIFXTOPE_GLM2"] = glm2_test_prep["DIF_VIGENCIA"] * glm2_test_prep["USO_TOPE"]
+    glm2_num_features_final = glm2_num_features_final + ["INTER_DIFXTOPE_GLM2"]
+
+X2_train_num = glm2_train_prep[glm2_num_features_final].copy()
+X2_test_num = glm2_test_prep[glm2_num_features_final].copy()
+
+X2_train_cat = pd.get_dummies(
+    glm2_train_prep[glm2_cat_features],
+    prefix=glm2_cat_features,
+    drop_first=True,
+    dtype=float
+)
+X2_test_cat = pd.get_dummies(
+    glm2_test_prep[glm2_cat_features],
+    prefix=glm2_cat_features,
+    drop_first=True,
+    dtype=float
+)
+
+X2_test_cat = X2_test_cat.reindex(columns=X2_train_cat.columns, fill_value=0.0)
+
+X2_train = pd.concat([X2_train_num, X2_train_cat], axis=1)
+X2_test = pd.concat([X2_test_num, X2_test_cat], axis=1)
+
+X2_train = X2_train.apply(pd.to_numeric, errors="coerce").astype(float)
+X2_test = X2_test.apply(pd.to_numeric, errors="coerce").astype(float)
+
+x2_medians = X2_train.median()
+X2_train = X2_train.fillna(x2_medians)
+X2_test = X2_test.fillna(x2_medians)
+
+X2_train = sm.add_constant(X2_train, has_constant="add")
+X2_test = sm.add_constant(X2_test, has_constant="add")
+X2_test = X2_test.reindex(columns=X2_train.columns, fill_value=0.0)
+
+y2_train = pd.to_numeric(glm2_train_prep["y_glm2"], errors="coerce").fillna(0).astype(float)
+y2_test = pd.to_numeric(glm2_test_prep["y_glm2"], errors="coerce").fillna(0).astype(float)
+
+print("Shape X2_train:", X2_train.shape)
+print("Shape X2_test :", X2_test.shape)
+
+# ============================================================
+# 14.5 GLM regularizado
+# ============================================================
+print_section("14.5) ENTRENAMIENTO GLM REGULARIZADO")
+
+glm2_bin = sm.GLM(
+    y2_train.values,
+    X2_train.values,
+    family=sm.families.Binomial()
+)
+
+# alpha más conservador para estabilizar coeficientes
+glm2_fit = glm2_bin.fit_regularized(
+    alpha=0.05,
+    L1_wt=0.0,   # ridge puro para estabilizar sin sparsear demasiado
+    maxiter=1000
+)
+
+pred2_train = glm2_fit.predict(X2_train.values)
+pred2_test = glm2_fit.predict(X2_test.values)
+
+print_section("14.5) MÉTRICAS GLM ESTABILIZADO")
+print("AUC train:", round(roc_auc_score(y2_train, pred2_train), 4))
+print("AUC test :", round(roc_auc_score(y2_test, pred2_test), 4))
+print("PR-AUC train:", round(average_precision_score(y2_train, pred2_train), 4))
+print("PR-AUC test :", round(average_precision_score(y2_test, pred2_test), 4))
+
+# ============================================================
+# 14.6 Coeficientes estabilizados
+# ============================================================
+print_section("14.6) COEFICIENTES GLM ESTABILIZADO")
+
+coef2_table = pd.DataFrame({
+    "feature": X2_train.columns,
+    "coef": glm2_fit.params,
+    "odds_ratio": np.exp(glm2_fit.params)
+}).sort_values("coef", ascending=False)
+
+coef2_table["abs_coef"] = coef2_table["coef"].abs()
+
+display(coef2_table.head(25))
+coef2_table.to_csv(os.path.join(OUT_DIR, "glm_estabilizado_coeficientes.csv"), index=False)
+
+# ============================================================
+# 14.7 Score GLM2 sobre todo el universo
+# ============================================================
+print_section("14.7) SCORE GLM ESTABILIZADO")
+
+glm2_all = glm2_df.copy()
+
+for c in glm2_num_features:
+    glm2_all[c] = pd.to_numeric(glm2_all[c], errors="coerce")
+    med = glm2_train_prep[c].median()
+    glm2_all[c] = glm2_all[c].fillna(med)
+
+for c in glm2_cat_features:
+    glm2_all[c] = glm2_all[c].fillna("MISSING").astype(str).str.strip().str.upper()
+    top_levels = glm2_train_prep[c].value_counts().head(5).index.tolist()
+    glm2_all[c] = np.where(glm2_all[c].isin(top_levels), glm2_all[c], "OTROS")
+
+if "INTER_DIFXTOPE_GLM2" in glm2_num_features_final and {"DIF_VIGENCIA", "USO_TOPE"}.issubset(glm2_all.columns):
+    glm2_all["INTER_DIFXTOPE_GLM2"] = glm2_all["DIF_VIGENCIA"] * glm2_all["USO_TOPE"]
+
+X2_all_num = glm2_all[glm2_num_features_final].copy()
+X2_all_cat = pd.get_dummies(
+    glm2_all[glm2_cat_features],
+    prefix=glm2_cat_features,
+    drop_first=True,
+    dtype=float
+)
+
+X2_all_cat = X2_all_cat.reindex(columns=X2_train_cat.columns, fill_value=0.0)
+
+X2_all = pd.concat([X2_all_num, X2_all_cat], axis=1)
+X2_all = X2_all.apply(pd.to_numeric, errors="coerce").astype(float)
+X2_all = X2_all.fillna(x2_medians.reindex(X2_all.columns, fill_value=0))
+X2_all = sm.add_constant(X2_all, has_constant="add")
+X2_all = X2_all.reindex(columns=X2_train.columns, fill_value=0.0)
+
+glm2_df["score_glm_stable"] = glm2_fit.predict(X2_all.values)
+
+# ============================================================
+# 14.8 Benchmark GLM2 vs GLM previo vs DIF_VIGENCIA
+# ============================================================
+print_section("14.8) BENCHMARK GLM ESTABILIZADO")
+
+glm2_test_eval = glm2_df.loc[glm2_test_mask, [id_col, "FEC_OCURRENCIA_FINAL", "y_glm2"]].copy()
+glm2_test_eval["score_glm_stable"] = pred2_test
+glm2_test_eval["score_rule_difvig"] = -pd.to_numeric(glm2_test_prep["DIF_VIGENCIA"], errors="coerce").fillna(999999).values
+
+if "score_glm_prod" in glm2_df.columns:
+    glm2_test_eval["score_glm_prev"] = glm2_df.loc[glm2_test_mask, "score_glm_prod"].values
+else:
+    glm2_test_eval["score_glm_prev"] = 0.0
+
+if "score_prod" in glm2_df.columns:
+    glm2_test_eval["score_prod_prev"] = glm2_df.loc[glm2_test_mask, "score_prod"].values
+else:
+    glm2_test_eval["score_prod_prev"] = 0.0
+
+bench2_rows = []
+bench2_dict = {
+    "regla_dif_vigencia": glm2_test_eval["score_rule_difvig"],
+    "glm_estabilizado": glm2_test_eval["score_glm_stable"],
+    "glm_previo": glm2_test_eval["score_glm_prev"],
+    "modelo_productivo_prev": glm2_test_eval["score_prod_prev"]
+}
+
+for name, scores in bench2_dict.items():
+    row = {
+        "modelo": name,
+        "auc_test": roc_auc_score(glm2_test_eval["y_glm2"], scores),
+        "pr_auc_test": average_precision_score(glm2_test_eval["y_glm2"], scores)
+    }
+
+    for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+        k_n = max(1, int(len(glm2_test_eval) * frac))
+        row[f"precision_top_{int(frac*100)}pct"] = precision_at_k(
+            glm2_test_eval["y_glm2"].reset_index(drop=True),
+            pd.Series(scores).reset_index(drop=True),
+            k_n
+        )
+
+    bench2_rows.append(row)
+
+benchmark_glm2_df = pd.DataFrame(bench2_rows).sort_values(["pr_auc_test", "auc_test"], ascending=False)
+
+display(benchmark_glm2_df)
+benchmark_glm2_df.to_csv(os.path.join(OUT_DIR, "benchmark_glm_estabilizado.csv"), index=False)
+
+# ============================================================
+# 14.9 Deciles del GLM estabilizado
+# ============================================================
+print_section("14.9) DECILES GLM ESTABILIZADO")
+
+glm2_test_eval["score_rank"] = glm2_test_eval["score_glm_stable"].rank(method="first")
+glm2_test_eval["decil_glm_stable"] = pd.qcut(glm2_test_eval["score_rank"], 10, labels=[f"D{i}" for i in range(1, 11)])
+
+glm2_decil_table = (
+    glm2_test_eval
+    .groupby("decil_glm_stable")
+    .agg(
+        n=(id_col, "count"),
+        n_sospechosos=("y_glm2", "sum"),
+        tasa_sospecha=("y_glm2", "mean"),
+        score_min=("score_glm_stable", "min"),
+        score_max=("score_glm_stable", "max"),
+        score_avg=("score_glm_stable", "mean")
+    )
+    .reset_index()
+)
+
+overall_glm2_rate = glm2_test_eval["y_glm2"].mean()
+glm2_decil_table["lift_vs_promedio"] = glm2_decil_table["tasa_sospecha"] / overall_glm2_rate
+
+display(glm2_decil_table)
+glm2_decil_table.to_csv(os.path.join(OUT_DIR, "deciles_glm_estabilizado_test.csv"), index=False)
+
+# ============================================================
+# 14.10 Cobertura acumulada GLM2
+# ============================================================
+print_section("14.10) COBERTURA GLM ESTABILIZADO")
+
+glm2_test_eval = glm2_test_eval.sort_values("score_glm_stable", ascending=False).reset_index(drop=True)
+glm2_test_eval["cum_sospechosos"] = glm2_test_eval["y_glm2"].cumsum()
+total_glm2_sos = glm2_test_eval["y_glm2"].sum()
+glm2_test_eval["recall_acumulado"] = glm2_test_eval["cum_sospechosos"] / total_glm2_sos if total_glm2_sos > 0 else np.nan
+glm2_test_eval["pct_revisado"] = (np.arange(len(glm2_test_eval)) + 1) / len(glm2_test_eval)
+
+glm2_coverage_rows = []
+for frac in [0.01, 0.03, 0.05, 0.10, 0.20]:
+    subset = glm2_test_eval.iloc[:max(1, int(len(glm2_test_eval) * frac))]
+    glm2_coverage_rows.append({
+        "pct_revisado": frac,
+        "n_revisado": len(subset),
+        "precision": subset["y_glm2"].mean(),
+        "recall": subset["y_glm2"].sum() / total_glm2_sos if total_glm2_sos > 0 else np.nan
+    })
+
+glm2_coverage_df = pd.DataFrame(glm2_coverage_rows)
+
+display(glm2_coverage_df)
+glm2_coverage_df.to_csv(os.path.join(OUT_DIR, "coverage_glm_estabilizado_test.csv"), index=False)
+
+# ============================================================
+# 14.11 Tramos operativos GLM2
+# ============================================================
+print_section("14.11) TRAMOS OPERATIVOS GLM ESTABILIZADO")
+
+p99_glm2 = glm2_df["score_glm_stable"].quantile(0.99)
+p95_glm2 = glm2_df["score_glm_stable"].quantile(0.95)
+p90_glm2 = glm2_df["score_glm_stable"].quantile(0.90)
+
+glm2_df["nivel_riesgo_glm_stable"] = np.select(
+    [
+        glm2_df["score_glm_stable"] >= p99_glm2,
+        glm2_df["score_glm_stable"] >= p95_glm2,
+        glm2_df["score_glm_stable"] >= p90_glm2
+    ],
+    [
+        "ALTO_RIESGO",
+        "RIESGO_MEDIO_ALTO",
+        "MONITOREO"
+    ],
+    default="BASE"
+)
+
+glm2_risk_table = (
+    glm2_df
+    .groupby("nivel_riesgo_glm_stable")
+    .agg(
+        n=(id_col, "count"),
+        tasa_sospecha=("y_glm2", "mean"),
+        score_min=("score_glm_stable", "min"),
+        score_max=("score_glm_stable", "max")
+    )
+    .reset_index()
+    .sort_values("score_min", ascending=False)
+)
+
+display(glm2_risk_table)
+glm2_risk_table.to_csv(os.path.join(OUT_DIR, "tramos_operativos_glm_estabilizado.csv"), index=False)
+
+# ============================================================
+# 14.12 Resumen final
+# ============================================================
+print_section("14.12) RESUMEN BLOQUE 14")
+print("1) Este bloque estabiliza el GLM con menos categorías y regularización ridge.")
+print("2) benchmark_glm_estabilizado.csv compara el GLM estabilizado contra la regla simple y los modelos previos.")
+print("3) deciles_glm_estabilizado_test.csv y coverage_glm_estabilizado_test.csv miden utilidad operativa.")
+print("4) tramos_operativos_glm_estabilizado.csv propone segmentación de riesgo más robusta.")
