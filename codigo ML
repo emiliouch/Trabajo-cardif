@@ -6100,6 +6100,18 @@ Por eso, en esta etapa final se construyó una comparación 1:1 entre:
 	•	N_SEG_12M_PRE_OCURR
 	•	EDAD_AL_SINIESTRO
 
+
+
+Política de reglas operativas
+
+La política de reglas operativas corresponde a un sistema de puntaje construido a partir de variables que, a lo largo del análisis, mostraron asociación con mayor nivel de sospecha. Su objetivo no es identificar fraude confirmado, sino priorizar casos para revisión de acuerdo con su perfil de riesgo.
+
+La estructura de esta política se definió asignando mayor peso a DIF_VIGENCIA, dado que fue la variable que mostró la señal más fuerte y consistente durante todo el estudio. Sobre esa base, se incorporaron señales complementarias que permitían refinar la priorización, en particular el nivel de USO_TOPE, la presencia de familiares con siniestros, la cantidad de seguros contratados recientemente y la edad al siniestro.
+
+En términos operativos, la política funciona sumando puntajes según ciertas condiciones. Los siniestros con menor DIF_VIGENCIA reciben la mayor cantidad de puntos, mientras que condiciones secundarias como USO_TOPE alto, CUENTA_SIN_FAMILIAR_AUX > 0, N_SEG_12M_PRE_OCURR >= 3 y EDAD_AL_SINIESTRO < 35 agregan puntaje adicional. La suma total define un score de riesgo que luego se traduce en niveles operativos de revisión: ALTO_RIESGO, RIESGO_MEDIO_ALTO, MONITOREO y BASE.
+
+La relevancia de esta política es que no depende de una sola regla binaria, sino de una combinación jerarquizada de señales. En la práctica, esto permitió construir una herramienta simple, interpretable y defendible, capaz de ordenar los casos de acuerdo con su prioridad de control sin necesidad de recurrir a una estructura algorítmica compleja.
+
 Diseño de la comparación
 
 La evaluación se realizó con un split temporal, lo que fue importante para evitar una validación artificialmente optimista.
