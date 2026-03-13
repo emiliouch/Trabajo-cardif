@@ -1,0 +1,176 @@
+Option Explicit
+
+Private Const FILE_PATTERN As String = "Data*.xls*"
+
+
+Private Const RUTA_CANAL As String = "'C:\ruta\[****CAMBIAR LA RUTA****.xlsx]RUTA_CANAL'!$A:$C"
+Private Const RUTA_MOTIVO As String = "'C:\ruta\[****CAMBIAR LA RUTA****.xlsx]RUTA_MOTIVO'!$A:$C"
+
+Public Sub ImportarData()
+
+    Dim wbMadre As Workbook
+    Dim wbOrigen As Workbook
+    Dim wsNueva As Worksheet
+    Dim wsTemp As Worksheet
+
+    Dim archivos As Variant
+    Dim i As Long
+    Dim nombreArchivo As String
+    Dim nombreHoja As String
+    Dim lastRow As Long
+
+    Dim prevCalc As XlCalculation
+    Dim prevScreenUpdating As Boolean
+    Dim prevEnableEvents As Boolean
+    Dim prevDisplayAlerts As Boolean
+    Dim prevAskToUpdateLinks As Boolean
+
+    On Error GoTo ErrHandler
+
+    Set wbMadre = ThisWorkbook
+
+    If Len(wbMadre.Path) = 0 Then
+        Err.Raise vbObjectError + 1000, , "Primero guarda el archivo madre en la carpeta donde están los Data*.xlsx."
+    End If
+
+    archivos = GetDataFiles(wbMadre.Path, wbMadre.Name)
+    If IsEmpty(archivos) Then
+        Err.Raise vbObjectError + 1001, , "No se encontraron archivos Data*.xls* en la misma carpeta."
+    End If
+
+    prevCalc = Application.Calculation
+    prevScreenUpdating = Application.ScreenUpdating
+    prevEnableEvents = Application.EnableEvents
+    prevDisplayAlerts = Application.DisplayAlerts
+    prevAskToUpdateLinks = Application.AskToUpdateLinks
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.AskToUpdateLinks = False
+    Application.Calculation = xlCalculationManual
+
+    ' Hoja temporal para poder dejar el libro sin la hoja por defecto
+    Set wsTemp = wbMadre.Worksheets.Add(Before:=wbMadre.Worksheets(1))
+    wsTemp.Name = "__TEMP__"
+
+    ' Eliminar todas las demás hojas
+    For i = wbMadre.Worksheets.Count To 1 Step -1
+        If wbMadre.Worksheets(i).Name <> wsTemp.Name Then
+            wbMadre.Worksheets(i).Delete
+        End If
+    Next i
+
+    ' Recorrer Data1, Data2, ..., DataN
+    For i = LBound(archivos) To UBound(archivos)
+
+        nombreArchivo = CStr(archivos(i))
+        nombreHoja = Left$(nombreArchivo, InStrRev(nombreArchivo, ".") - 1)
+
+        Set wbOrigen = Workbooks.Open( _
+            Filename:=wbMadre.Path & Application.PathSeparator & nombreArchivo, _
+            UpdateLinks:=0, _
+            ReadOnly:=True, _
+            AddToMru:=False, _
+            Notify:=False)
+
+        wbOrigen.Worksheets(nombreHoja).Copy After:=wbMadre.Worksheets(wbMadre.Worksheets.Count)
+        wbOrigen.Close SaveChanges:=False
+        Set wbOrigen = Nothing
+
+        Set wsNueva = wbMadre.Worksheets(wbMadre.Worksheets.Count)
+
+        With wsNueva
+            ' F1: Canal -> Canal 2
+            .Range("F1").Value = "Canal 2"
+
+            ' Tomo última fila según K, porque la fórmula depende de K
+            lastRow = .Cells(.Rows.Count, "K").End(xlUp).Row
+
+            If lastRow >= 2 Then
+                ' Fórmula agnóstica al idioma:
+                ' en Excel español se mostrará como:
+                ' =SI(K2="";"";BUSCARV(K2;RUTA...;3;FALSO))
+                .Range("O2:O" & lastRow).FormulaR1C1 = _
+                    "=IF(RC11="""","""",VLOOKUP(RC11," & RUTA_CANAL & ",3,FALSE))"
+
+                .Range("P2:P" & lastRow).FormulaR1C1 = _
+                    "=IF(RC11="""","""",VLOOKUP(RC11," & RUTA_MOTIVO & ",3,FALSE))"
+            End If
+        End With
+
+    Next i
+
+    wsTemp.Delete
+
+CleanExit:
+    Application.Calculation = prevCalc
+    Application.ScreenUpdating = prevScreenUpdating
+    Application.EnableEvents = prevEnableEvents
+    Application.DisplayAlerts = prevDisplayAlerts
+    Application.AskToUpdateLinks = prevAskToUpdateLinks
+    Exit Sub
+
+ErrHandler:
+    On Error Resume Next
+    If Not wbOrigen Is Nothing Then wbOrigen.Close SaveChanges:=False
+    MsgBox Err.Description, vbCritical, "ImportarData"
+    Resume CleanExit
+
+End Sub
+
+Private Function GetDataFiles(ByVal folderPath As String, ByVal excludeName As String) As Variant
+
+    Dim f As String
+    Dim n As Long
+    Dim arr() As String
+
+    If Right$(folderPath, 1) <> "\" Then folderPath = folderPath & "\"
+
+    f = Dir(folderPath & FILE_PATTERN)
+
+    Do While Len(f) > 0
+        If Left$(f, 2) <> "~$" Then
+            If StrComp(f, excludeName, vbTextCompare) <> 0 Then
+                n = n + 1
+                ReDim Preserve arr(1 To n)
+                arr(n) = f
+            End If
+        End If
+        f = Dir
+    Loop
+
+    If n = 0 Then Exit Function
+
+    SortDataFiles arr
+    GetDataFiles = arr
+
+End Function
+
+Private Sub SortDataFiles(ByRef arr() As String)
+
+    Dim i As Long
+    Dim j As Long
+    Dim tmp As String
+
+    For i = LBound(arr) To UBound(arr) - 1
+        For j = i + 1 To UBound(arr)
+            If ExtractDataNumber(arr(j)) < ExtractDataNumber(arr(i)) Then
+                tmp = arr(i)
+                arr(i) = arr(j)
+                arr(j) = tmp
+            End If
+        Next j
+    Next i
+
+End Sub
+
+Private Function ExtractDataNumber(ByVal fileName As String) As Long
+
+    Dim baseName As String
+    baseName = Left$(fileName, InStrRev(fileName, ".") - 1)
+
+    ' "Data15.xlsx" -> 15
+    ExtractDataNumber = Val(Mid$(baseName, 5))
+
+End Function
