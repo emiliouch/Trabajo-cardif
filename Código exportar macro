@@ -2,9 +2,8 @@ Option Explicit
 
 Private Const FILE_PATTERN As String = "Data*.xls*"
 
-
-Private Const RUTA_CANAL As String = "'C:\ruta\[****CAMBIAR LA RUTA****.xlsx]RUTA_CANAL'!$A:$C"
-Private Const RUTA_MOTIVO As String = "'C:\ruta\[****CAMBIAR LA RUTA****.xlsx]RUTA_MOTIVO'!$A:$C"
+Private Const RUTA_CANAL As String = "'C:\ruta\[Catalogos.xlsx]RUTA_CANAL'!"
+Private Const RUTA_MOTIVO As String = "'C:\ruta\[Catalogos.xlsx]RUTA_MOTIVO'!"
 
 Public Sub ImportarData()
 
@@ -35,7 +34,7 @@ Public Sub ImportarData()
 
     archivos = GetDataFiles(wbMadre.Path, wbMadre.Name)
     If IsEmpty(archivos) Then
-        Err.Raise vbObjectError + 1001, , "No se encontraron archivos Data*.xls* en la misma carpeta."
+        Err.Raise vbObjectError + 1001, , "No se encontraron archivos Data*.xls* en la misma carpeta del archivo madre."
     End If
 
     prevCalc = Application.Calculation
@@ -50,18 +49,16 @@ Public Sub ImportarData()
     Application.AskToUpdateLinks = False
     Application.Calculation = xlCalculationManual
 
-    ' Hoja temporal para poder dejar el libro sin la hoja por defecto
+    ' Hoja temporal para poder borrar todas las demás
     Set wsTemp = wbMadre.Worksheets.Add(Before:=wbMadre.Worksheets(1))
     wsTemp.Name = "__TEMP__"
 
-    ' Eliminar todas las demás hojas
     For i = wbMadre.Worksheets.Count To 1 Step -1
         If wbMadre.Worksheets(i).Name <> wsTemp.Name Then
             wbMadre.Worksheets(i).Delete
         End If
     Next i
 
-    ' Recorrer Data1, Data2, ..., DataN
     For i = LBound(archivos) To UBound(archivos)
 
         nombreArchivo = CStr(archivos(i))
@@ -81,21 +78,18 @@ Public Sub ImportarData()
         Set wsNueva = wbMadre.Worksheets(wbMadre.Worksheets.Count)
 
         With wsNueva
-            ' F1: Canal -> Canal 2
             .Range("F1").Value = "Canal 2"
 
-            ' Tomo última fila según K, porque la fórmula depende de K
+            ' Tomo la última fila según la columna K
             lastRow = .Cells(.Rows.Count, "K").End(xlUp).Row
+            If lastRow < 2 Then lastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
 
             If lastRow >= 2 Then
-                ' Fórmula agnóstica al idioma:
-                ' en Excel español se mostrará como:
-                ' =SI(K2="";"";BUSCARV(K2;RUTA...;3;FALSO))
                 .Range("O2:O" & lastRow).FormulaR1C1 = _
-                    "=IF(RC11="""","""",VLOOKUP(RC11," & RUTA_CANAL & ",3,FALSE))"
+                    "=VLOOKUP(RC1," & RUTA_CANAL & "$B:$V,21,FALSE)"
 
                 .Range("P2:P" & lastRow).FormulaR1C1 = _
-                    "=IF(RC11="""","""",VLOOKUP(RC11," & RUTA_MOTIVO & ",3,FALSE))"
+                    "=IF(RC11="""","""",VLOOKUP(RC11," & RUTA_MOTIVO & "$A:$C,3,FALSE))"
             End If
         End With
 
@@ -149,8 +143,7 @@ End Function
 
 Private Sub SortDataFiles(ByRef arr() As String)
 
-    Dim i As Long
-    Dim j As Long
+    Dim i As Long, j As Long
     Dim tmp As String
 
     For i = LBound(arr) To UBound(arr) - 1
@@ -170,7 +163,6 @@ Private Function ExtractDataNumber(ByVal fileName As String) As Long
     Dim baseName As String
     baseName = Left$(fileName, InStrRev(fileName, ".") - 1)
 
-    ' "Data15.xlsx" -> 15
     ExtractDataNumber = Val(Mid$(baseName, 5))
 
 End Function
