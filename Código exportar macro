@@ -78,20 +78,21 @@ Public Sub ImportarData()
         Set wsNueva = wbMadre.Worksheets(wbMadre.Worksheets.Count)
 
         With wsNueva
+            Debug.Print "=VLOOKUP(A2," & RUTA_CANAL & "$B:$V,21,FALSE)"
+            Debug.Print "=IF(K2="""","""",VLOOKUP(K2," & RUTA_MOTIVO & "$A:$C,3,FALSE))"
             .Range("F1").Value = "Canal 2"
 
-            ' Tomo la última fila según la columna K
             lastRow = .Cells(.Rows.Count, "K").End(xlUp).Row
             If lastRow < 2 Then lastRow = .Cells(.Rows.Count, "A").End(xlUp).Row
 
             If lastRow >= 2 Then
-                .Range("O2:O" & lastRow).FormulaR1C1 = _
-                    "=VLOOKUP(RC1," & RUTA_CANAL & "$B:$V,21,FALSE)"
+                .Range("O2:O" & lastRow).Formula = _
+                    "=VLOOKUP(A2," & RUTA_CANAL & "$B:$V,21,FALSE)"
 
-                .Range("P2:P" & lastRow).FormulaR1C1 = _
-                    "=IF(RC11="""","""",VLOOKUP(RC11," & RUTA_MOTIVO & "$A:$C,3,FALSE))"
+                .Range("P2:P" & lastRow).Formula = _
+                    "=IF(K2="""","""",VLOOKUP(K2," & RUTA_MOTIVO & "$A:$C,3,FALSE))"
             End If
-        End With
+End With
 
     Next i
 
